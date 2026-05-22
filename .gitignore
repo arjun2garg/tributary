@@ -1,0 +1,4 @@
+.venv/
+tributary-core/target/
+*.gguf
+~/.cache/huggingface/
