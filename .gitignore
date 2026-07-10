@@ -2,3 +2,4 @@
 tributary-core/target/
 *.gguf
 ~/.cache/huggingface/
+tributary-mlx/__pycache__/
