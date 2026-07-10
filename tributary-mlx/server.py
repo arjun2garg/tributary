@@ -1,8 +1,10 @@
 import time
-
+import json
+import asyncio
+import mlx.core as mx
 from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-
 from model import PartialModel
 
 app = FastAPI()
@@ -15,34 +17,53 @@ model = PartialModel(
 
 class GenerateRequest(BaseModel):
     prompt: str
-    max_tokens: int = 100
+    max_tokens: int = 200
+    temperature: float = 0.0
 
-class TokenResponse(BaseModel):
-    token: str
-    token_id: int
-    tokens_per_sec: float
+async def token_stream(prompt: str, max_tokens: int, temperature: float):
+    model.reset_cache()
+    token_ids = model.tokenizer.encode(prompt)
+    t_start = time.perf_counter()
 
-@app.post("/generate")
-async def generate(req: GenerateRequest):
-    tokens = []
-    start = time.time()
-    hidden = model.embed(req.prompt)
-    for i in range(req.max_tokens):
-        hidden = model.forward_partial(hidden)
-        next_id = model.decode(hidden)
+    hidden = model.embed(token_ids)
+    hidden = model.prefill(hidden)
+    logits = model.decode_logits(hidden)
+    next_id = model.sample_token(logits[:, -1:, :], temperature)
+    token_count = 0
+    t_first = time.perf_counter()
+
+    for _ in range(max_tokens):
+        token_str = model.tokenizer.decode([next_id])
+        event = json.dumps({
+            "token": token_str,
+            "token_id": next_id,
+            "token_count": token_count,
+        })
+        yield f"data: {event}\n\n"
+
         if next_id == model.tokenizer.eos_token_id:
             break
 
-        token_str = model.tokenizer.decode([next_id])
-        tokens.append(token_str)
+        hidden = model.embed([next_id])
+        hidden = model.decode_step(hidden)
+        logits = model.decode_logits(hidden)
+        next_id = model.sample_token(logits, temperature)
+        mx.eval(next_id)
+        token_count += 1
 
-        all_text = req.prompt + "".join(tokens)
-        hidden = model.embed(all_text) # very inefficient since no KV cache yet
+        await asyncio.sleep(0)
     
-    elapsed = time.time() - start
-    return {
-        "text": "".join(tokens),
-        "tokens": len(tokens),
-        "tokens_per_sec": len(tokens) / elapsed
-    }
+    elapsed = time.perf_counter() - t_first
+    summary = json.dumps({
+        "tokens": token_count,
+        "tokens_per_sec": token_count / elapsed if elapsed > 0 else 0,
+        "time_to_first_token": t_first - t_start,
+    })
+    yield f"data: {summary}\n\n"
 
+@app.post("/generate")
+async def generate(req: GenerateRequest):
+    return StreamingResponse(
+        token_stream(req.prompt, req.max_tokens, req.temperature),
+        media_type="text/event-stream"
+    )
