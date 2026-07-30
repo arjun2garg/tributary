@@ -4,11 +4,26 @@ from mlx_lm import load
 from mlx_lm.models.cache import make_prompt_cache
 
 class PartialModel:
-    def __init__(self, model_path: str, start_layer: int, end_layer: int):
+    def __init__(self, model_path: str, start_layer: int = 0, end_layer: int | None = None):
         self.model, self.tokenizer = load(model_path)
+        self.num_layers = len(self.model.model.layers)
         self.start_layer = start_layer
-        self.end_layer = end_layer
+        self.end_layer = end_layer if end_layer is not None else self.num_layers
         self.cache = None
+
+        if not (0 <= self.start_layer < self.end_layer <= self.num_layers):
+            raise ValueError(
+                f"invalid layer range {self.start_layer}..{self.end_layer} "
+                f"(model has {self.num_layers} layers)"
+            )
+    
+    @property
+    def is_first(self) -> bool:
+        return self.start_layer == 0
+    
+    @property
+    def is_last(self) -> bool:
+        return self.end_layer == self.num_layers
     
     def reset_cache(self):
         self.cache = None
