@@ -44,6 +44,12 @@ async def forward(request: Request, mode: str):
     x = tensor_from_request(await request.body(), request.headers.get("x-shape"), request.headers.get("x-dtype"))
     if mode == "prefill":
         out = model.prefill(x)
+        print(
+            f"[mem] layers {model.start_layer}..{model.end_layer} | "
+            f"active {mx.get_active_memory() / 1e9:.2f} GB | "
+            f"peak {mx.get_peak_memory() / 1e9:.2f} GB",
+            flush=True,
+        )
     elif mode == "decode":
         out = model.decode_step(x)
     else:
@@ -87,6 +93,8 @@ async def info():
         "num_layers": model.num_layers,
         "is_first": model.is_first,
         "is_last": model.is_last,
+        "active_memory_gb": round(mx.get_active_memory() / 1e9, 3),
+        "peak_memory_gb": round(mx.get_peak_memory() / 1e9, 3),
     }
 
 if __name__ == "__main__":

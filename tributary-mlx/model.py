@@ -5,7 +5,7 @@ from mlx_lm.models.cache import make_prompt_cache
 
 class PartialModel:
     def __init__(self, model_path: str, start_layer: int = 0, end_layer: int | None = None):
-        self.model, self.tokenizer = load(model_path)
+        self.model, self.tokenizer = load(model_path, lazy=True)
         self.num_layers = len(self.model.model.layers)
         self.start_layer = start_layer
         self.end_layer = end_layer if end_layer is not None else self.num_layers
