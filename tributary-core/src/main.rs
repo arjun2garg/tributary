@@ -328,46 +328,50 @@ async fn run_worker(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let local = MlxClient::new(args.mlx_server.clone());
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
     eprintln!("worker listening on 0.0.0.0:{port}");
-    let (mut stream, peer) = listener.accept().await?;
-    eprintln!("coordinator connected from {peer}");
 
     loop {
-        let frame = match read_frame(&mut stream).await {
-            Ok(f) => f,
-            Err(e) => {
-                eprintln!("worker: connection closed ({e})");
-                break;
-            }
-        };
+        let (mut stream, peer) = listener.accept().await?;
+        eprintln!("coordinator connected from {peer}");
 
-        match frame.msg_type {
-            MsgType::Info => {
-                let info = local.info().await?;
-                let mut reply = Frame::control(MsgType::Info, frame.seq);
-                reply.shape = vec![info.start_layer, info.end_layer, info.num_layers];
-                write_frame(&mut stream, &reply).await?;
-            }
-            MsgType::ResetCache => {
-                local.reset().await?;
-            }
-            MsgType::Prefill | MsgType::DecodeStep => {
-                let seq = frame.seq;
-                let mode = if frame.msg_type == MsgType::Prefill { "prefill" } else { "decode" };
+        loop {
+            let frame = match read_frame(&mut stream).await {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("worker: connection closed ({e})");
+                    break;
+                }
+            };
 
-                let t_compute = Instant::now();
-                let tensor = frame.into_tensor();
-                let hidden = local.forward(&tensor, mode).await?;
-                let logits = local.logits(&hidden).await?;
-                let compute_us = t_compute.elapsed().as_micros() as u64;
+            match frame.msg_type {
+                MsgType::Info => {
+                    let info = local.info().await?;
+                    let mut reply = Frame::control(MsgType::Info, frame.seq);
+                    reply.shape = vec![info.start_layer, info.end_layer, info.num_layers];
+                    write_frame(&mut stream, &reply).await?;
+                }
+                MsgType::ResetCache => {
+                    local.reset().await?;
+                }
+                MsgType::Prefill | MsgType::DecodeStep => {
+                    let seq = frame.seq;
+                    let mode = if frame.msg_type == MsgType::Prefill { "prefill" } else { "decode" };
 
-                let mut reply = Frame::from_tensor(MsgType::Logits, seq, &logits);
-                reply.worker_compute_us = compute_us;
-                write_frame(&mut stream, &reply).await?;
-            }
-            MsgType::Logits => {
-                return Err("worker received an unexpected Logits frame".into());
+                    let t_compute = Instant::now();
+                    let tensor = frame.into_tensor();
+                    let hidden = local.forward(&tensor, mode).await?;
+                    let logits = local.logits(&hidden).await?;
+                    let compute_us = t_compute.elapsed().as_micros() as u64;
+
+                    let mut reply = Frame::from_tensor(MsgType::Logits, seq, &logits);
+                    reply.worker_compute_us = compute_us;
+                    write_frame(&mut stream, &reply).await?;
+                }
+                MsgType::Logits => {
+                    return Err("worker received an unexpected Logits frame".into());
+                }
             }
         }
+        local.reset().await?;
+        eprintln!("worker: ready for next connection");
     }
-    Ok(())
 }
