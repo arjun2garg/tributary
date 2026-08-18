@@ -88,3 +88,65 @@ on A → forward + logits on B → sample. Each process holds its own KV cache.
   is weights
 - First generation after server start is much slower (ttft 8–23 s observed) — weight
   page-in / warmup, not steady-state
+
+# Two-Node Pipeline (Two Physical Machines)
+
+Model: Llama-3.2-3B-Instruct-4bit  
+Coordinator: 2023 MacBook Air, M2, 8GB RAM (embed + layers 0–14 + sampling)  
+Worker: second Mac (layers 14–28 + final norm + lm_head), listening on `0.0.0.0:9000`  
+Date: August 17, 2026
+
+Coordinator drives the Rust generation loop; per decoded token it runs its local layer
+range, ships the hidden activation to the worker over a persistent length-prefixed TCP
+frame, and the worker returns logits. One worker instance serves both transports
+(reachable on its Thunderbolt IP and its WiFi IP). 200 generated tokens/run, greedy
+(temperature 0), one worker warm-up discarded.
+
+## Throughput
+
+| Prompt tokens | Thunderbolt (tok/s) | WiFi (tok/s) | TB ttft (s) | WiFi ttft (s) |
+|--------------:|--------------------:|-------------:|------------:|--------------:|
+|            12 |                20.9 |         11.2 |        0.13 |          0.24 |
+|            59 |                21.2 |         11.3 |        0.25 |          0.38 |
+|           110 |                21.1 |         11.3 |        0.35 |          0.52 |
+|           256 |                21.2 |         11.4 |        0.72 |          0.98 |
+
+Throughput is flat across prompt length (KV cache working as expected); the transport is
+the only lever — Thunderbolt is ~1.9× WiFi.
+
+## Per-token decode latency (median, ms)
+
+`round-trip` = activation send + worker compute + logits return (one TCP exchange);
+`local` = coordinator embed + layers 0–14; `serialize`/`deserialize` are <0.01 ms and omitted.
+
+| Transport | local | network | worker | round-trip | sample |
+|-----------|------:|--------:|-------:|-----------:|-------:|
+| Thunderbolt |  19.4 |    0.77 |   22.6 |       23.4 |    2.0 |
+| WiFi        |  21.0 |   29.8  |   22.1 |       52.5 |    2.6 |
+
+## Wire sizes (measured)
+
+| Transfer | Size |
+|---|---|
+| Decode activation (1 token, out) | 6,144 B (~6 KB) |
+| Logits (1 position, back) | 256,512 B (~256 KB) |
+| Prefill activation, 256-token prompt (out) | 1,572,864 B (~1.5 MB) |
+
+Matches the step-2 design estimates exactly (hidden 3072 × fp16; vocab 128,256 × fp16).
+
+## Notes
+- Greedy output is byte-identical across both transports for all four prompts, and the
+  pipeline is byte-identical to single-node — the network split is lossless (success
+  criterion 1)
+- **The network round-trip is the entire TB→WiFi delta.** Everything else is within
+  noise between transports; round-trip goes 23.4 ms → 52.5 ms and throughput halves.
+  That ~30 ms WiFi round-trip is dominated by the 256 KB logits coming *back*, not the
+  6 KB activation going out — the logits-asymmetry cost flagged in the step-2 plan,
+  now measured as the load-bearing term over WiFi
+- **The pipeline bubble, measured firsthand:** local (~19–21 ms) and worker (~22 ms)
+  run strictly serially, so each machine sits idle roughly half of every token. Even on
+  Thunderbolt (near-zero network) two-node throughput (~21 tok/s) is below the single-
+  process single-node loop (~33 tok/s) — the two devices don't overlap. This is the
+  "before" picture step 3/4 speculative decoding is meant to recover by keeping both
+  busy
+- Raw per-token CSVs in `bench_out/{tb,wifi}_{10,50,100,250}.csv`
