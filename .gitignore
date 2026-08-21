@@ -5,3 +5,10 @@ tributary-core/target/
 tributary-mlx/__pycache__/
 tributary.md
 tributary-core/*.bin
+scripts/
+bench_out/
+*.log
+.DS_Store
+tributary-core/two_machine.csv
+docs/
+bench_out_run.log

@@ -47,6 +47,7 @@ async def forward(request: Request, mode: str):
         print(
             f"[mem] layers {model.start_layer}..{model.end_layer} | "
             f"active {mx.get_active_memory() / 1e9:.2f} GB | "
+            f"cache {mx.get_cache_memory() / 1e9:.2f} GB | "
             f"peak {mx.get_peak_memory() / 1e9:.2f} GB",
             flush=True,
         )
@@ -68,6 +69,25 @@ async def logits(request: Request, last_only: bool = False):
 @app.post("/reset")
 async def reset():
     model.reset_cache()
+    mx.clear_cache()
+    return {"ok": True}
+
+@app.post("/draft")
+async def draft(cur: int, k: int):
+    if not model.is_first:
+        raise HTTPException(400, f"/draft requires layer 0; this instance starts at {model.start_layer}")
+    return {"token_ids": model.draft_generate(cur, k)}
+
+@app.post("/argmax")
+async def argmax(request: Request):
+    if not model.is_last:
+        raise HTTPException(400, f"/argmax requires the final layer ({model.num_layers}); this instance ends at {model.end_layer}")
+    x = tensor_from_request(await request.body(), request.headers.get("x-shape"), request.headers.get("x-dtype"))
+    return {"token_ids": model.greedy_all(x)}
+
+@app.post("/trim")
+async def trim(n: int):
+    model.trim(n)
     return {"ok": True}
 
 @app.post("/sample")
@@ -94,6 +114,7 @@ async def info():
         "is_first": model.is_first,
         "is_last": model.is_last,
         "active_memory_gb": round(mx.get_active_memory() / 1e9, 3),
+        "cache_memory_gb": round(mx.get_cache_memory() / 1e9, 3),
         "peak_memory_gb": round(mx.get_peak_memory() / 1e9, 3),
     }
 
@@ -103,7 +124,14 @@ if __name__ == "__main__":
     parser.add_argument("--start-layer", type=int, default=0)
     parser.add_argument("--end-layer", type=int, default=None)
     parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--cache-limit-gb", type=float, default=None,
+                        help="cap MLX's reusable buffer cache (GB). Lower = less RSS/swap, "
+                             "slightly more re-allocation. Set on RAM-tight nodes.")
     args = parser.parse_args()
+
+    if args.cache_limit_gb is not None:
+        mx.set_cache_limit(int(args.cache_limit_gb * 1e9))
+        print(f"[mem] MLX cache limit set to {args.cache_limit_gb} GB")
 
     model = PartialModel(args.model, start_layer=args.start_layer, end_layer=args.end_layer)
     print(

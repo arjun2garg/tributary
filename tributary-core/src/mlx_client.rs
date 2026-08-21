@@ -30,6 +30,11 @@ struct SampleResponse {
 }
 
 #[derive(Deserialize)]
+struct TokenIdsResponse {
+    token_ids: Vec<u32>,
+}
+
+#[derive(Deserialize)]
 pub struct Info {
     pub start_layer: u32,
     pub end_layer: u32,
@@ -123,6 +128,37 @@ impl MlxClient {
             .error_for_status()?
             .json().await?;
         Ok(resp.token_id)
+    }
+
+    pub async fn draft(&self, cur: u32, k: u32) -> Result<Vec<u32>> {
+        let resp: TokenIdsResponse = self.http
+            .post(format!("{}/draft", self.base))
+            .query(&[("cur", cur), ("k", k)])
+            .send().await?
+            .error_for_status()?
+            .json().await?;
+        Ok(resp.token_ids)
+    }
+
+    pub async fn argmax(&self, x: &Tensor) -> Result<Vec<u32>> {
+        let resp: TokenIdsResponse = self.http
+            .post(format!("{}/argmax", self.base))
+            .header("X-Shape", &x.shape)
+            .header("X-Dtype", "float16")
+            .body(x.data.clone())
+            .send().await?
+            .error_for_status()?
+            .json().await?;
+        Ok(resp.token_ids)
+    }
+
+    pub async fn trim(&self, n: u32) -> Result<()> {
+        self.http
+            .post(format!("{}/trim", self.base))
+            .query(&[("n", n)])
+            .send().await?
+            .error_for_status()?;
+        Ok(())
     }
 
     async fn tensor_from_response(resp: reqwest::Response) -> Result<Tensor> {

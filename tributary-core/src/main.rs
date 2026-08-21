@@ -44,7 +44,13 @@ struct Args {
     listen: Option<u16>,
 
     #[arg(long)]
-    timing_csv: Option<String>
+    timing_csv: Option<String>,
+
+    #[arg(long, default_value_t = 0)]
+    spec_k: u32,
+
+    #[arg(long)]
+    draft_model: Option<String>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -118,10 +124,101 @@ fn write_timing_csv(path: &str, prefill: &StepTiming, steps: &[StepTiming]) -> s
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     match args.mode {
+        Mode::Single if args.spec_k > 0 => run_spec_loop(&args).await,
         Mode::Single => run_loop(&args).await,
         Mode::Coordinator => run_coordinator(&args).await,
         Mode::Worker => run_worker(&args).await,
     }
+}
+
+async fn run_spec_loop(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    let prompt = args.prompt.as_ref().ok_or("spec mode requires --prompt")?;
+    let draft_url = args.draft_model.as_ref().ok_or("--spec-k requires --draft-model")?;
+    let k = args.spec_k;
+    let target = MlxClient::new(args.mlx_server.clone());
+    let draft = MlxClient::new(draft_url.clone());
+
+    target.reset().await?;
+    draft.reset().await?;
+
+    let (ids, eos) = target.tokenize(prompt).await?;
+    let t_start = Instant::now();
+
+    let ht = target.forward(&target.embed(&ids).await?, "prefill").await?;
+    let _ = draft.forward(&draft.embed(&ids).await?, "prefill").await?;
+    let mut cur = *target
+        .argmax(&ht)
+        .await?
+        .last()
+        .ok_or("empty prefill argmax")?;
+
+    let mut rounds: u64 = 0;
+    let mut accepted_sum: u64 = 0;
+    let mut draft_us: u128 = 0;
+    let mut verify_us: u128 = 0;
+    let mut token_count: u32 = 1;
+
+    print!("{}", target.detokenize(&[cur]).await?);
+    std::io::stdout().flush()?;
+    let t_first = Instant::now();
+
+    if cur != eos {
+        'outer: while token_count < args.max_tokens {
+            let t_d = Instant::now();
+            let x = draft.draft(cur, k).await?;
+            draft_us += t_d.elapsed().as_micros();
+
+            let t_v = Instant::now();
+            let mut verify_ids = Vec::with_capacity(x.len() + 1);
+            verify_ids.push(cur);
+            verify_ids.extend_from_slice(&x);
+            let h = target.forward(&target.embed(&verify_ids).await?, "decode").await?;
+            let t = target.argmax(&h).await?;
+            verify_us += t_v.elapsed().as_micros();
+
+            let mut a = 0usize;
+            while a < k as usize && t[a] == x[a] {
+                a += 1;
+            }
+            let mut emitted: Vec<u32> = x[..a].to_vec();
+            emitted.push(t[a]);
+
+            let trim = k - a as u32;
+            target.trim(trim).await?;
+            draft.trim(trim).await?;
+
+            rounds += 1;
+            accepted_sum += a as u64;
+
+            for &tok in &emitted {
+                print!("{}", target.detokenize(&[tok]).await?);
+                std::io::stdout().flush()?;
+                token_count += 1;
+                cur = tok;
+                if tok == eos || token_count >= args.max_tokens {
+                    break 'outer;
+                }
+            }
+        }
+    }
+
+    let elapsed = t_first.elapsed().as_secs_f32();
+    let gen_tokens = token_count.saturating_sub(1); // tokens after #0, comparable to baseline
+    let alpha = if rounds > 0 { accepted_sum as f64 / (rounds as f64 * k as f64) } else { 0.0 };
+    let mean_acc = if rounds > 0 { gen_tokens as f64 / rounds as f64 } else { 0.0 };
+    eprintln!("\n");
+    eprintln!(
+        "tributary (spec K={k}) | {token_count} tokens | {:.1} tok/s | ttft: {:.2}s",
+        if elapsed > 0.0 { gen_tokens as f32 / elapsed } else { 0.0 },
+        (t_first - t_start).as_secs_f32()
+    );
+    eprintln!(
+        "spec | rounds={rounds} accept_rate α={alpha:.3} mean_accepted/verify={mean_acc:.2} | \
+         draft={}µs verify={}µs (mean/round)",
+        if rounds > 0 { draft_us / rounds as u128 } else { 0 },
+        if rounds > 0 { verify_us / rounds as u128 } else { 0 },
+    );
+    Ok(())
 }
 
 async fn run_loop (args: &Args) -> Result<(), Box<dyn std::error::Error>> {

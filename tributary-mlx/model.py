@@ -1,7 +1,8 @@
 import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm import load
-from mlx_lm.models.cache import make_prompt_cache
+from mlx_lm.models.base import create_attention_mask
+from mlx_lm.models.cache import make_prompt_cache, trim_prompt_cache
 
 class PartialModel:
     def __init__(self, model_path: str, start_layer: int = 0, end_layer: int | None = None):
@@ -44,13 +45,39 @@ class PartialModel:
     def decode_step(self, hidden_states: mx.array) -> mx.array:
         assert self.cache is not None
         x = hidden_states
+        mask = create_attention_mask(x, self.cache[0])
         for i in range(self.start_layer, self.end_layer):
-            x = self.model.model.layers[i](x, mask=None, cache=self.cache[i - self.start_layer])
+            x = self.model.model.layers[i](x, mask=mask, cache=self.cache[i - self.start_layer])
         return x
-    
+
+    def trim(self, n: int) -> None:
+        if self.cache is not None and n > 0:
+            trim_prompt_cache(self.cache, n)
+
+    def draft_generate(self, cur: int, k: int) -> list[int]:
+        assert self.cache is not None
+        out: list[int] = []
+        tok = cur
+        for _ in range(k):
+            h = self.embed([tok])
+            h = self.decode_step(h)
+            logits = self.decode_logits(h)
+            tok = int(mx.argmax(logits[0, -1, :]).item())
+            out.append(tok)
+        h = self.decode_step(self.embed([out[-1]]))
+        mx.eval(h)
+        return out
+
+    def greedy_all(self, hidden_states: mx.array) -> list[int]:
+        logits = self.decode_logits(hidden_states)
+        toks = mx.argmax(logits, axis=-1)  # [1, T]
+        return [int(t) for t in toks[0].tolist()]
+
     def decode_logits(self, hidden_states: mx.array) -> mx.array:
         x = self.model.model.norm(hidden_states)
-        return self.model.model.embed_tokens.as_linear(x)
+        if self.model.args.tie_word_embeddings:
+            return self.model.model.embed_tokens.as_linear(x)
+        return self.model.lm_head(x)
     
     def sample_token(self, logits: mx.array, temperature: float = 0.0) -> int:
         last_logits = logits[0, -1, :]
