@@ -14,6 +14,16 @@ pub enum MsgType {
     Logits = 2,
     ResetCache = 3,
     Info = 4,
+    Trim = 5,
+    // Speculative-decoding verify: coordinator ships K+1 activations, worker runs its
+    // shard over all positions and replies with a VerifyResult.
+    Verify = 6,
+    // Reply to Verify. For greedy: `aux` = worker's argmax token id at each of the K+1
+    // positions. For sampled (temp>0): `payload` = K+1 fp32 target probs p_i(x_i).
+    VerifyResult = 7,
+    // Phase-2 lazy-logits request: `aux[0]` = position j; worker replies with a Logits
+    // frame carrying only that one full distribution.
+    LogitsAt = 8,
 }
 
 impl TryFrom<u8> for MsgType {
@@ -25,6 +35,10 @@ impl TryFrom<u8> for MsgType {
             2 => Ok(MsgType::Logits),
             3 => Ok(MsgType::ResetCache),
             4 => Ok(MsgType::Info),
+            5 => Ok(MsgType::Trim),
+            6 => Ok(MsgType::Verify),
+            7 => Ok(MsgType::VerifyResult),
+            8 => Ok(MsgType::LogitsAt),
             _ => Err(format!("unknown msg_type byte: {v}").into()),
         }
     }
@@ -35,18 +49,25 @@ pub struct Frame {
     pub seq: u32,
     pub worker_compute_us: u64,
     pub shape: Vec<u32>,
+    // Small control side-channel of u32s: trim count (Trim), position (LogitsAt),
+    // drafted token ids (Verify), or result token ids (VerifyResult).
+    pub aux: Vec<u32>,
     pub dtype: u8,
     pub payload: Bytes,
 }
 
 impl Frame {
     pub fn control(msg_type: MsgType, seq: u32) -> Self {
-        Frame { msg_type, seq, worker_compute_us: 0, shape: Vec::new(), dtype: 0, payload: Bytes::new() }
+        Frame { msg_type, seq, worker_compute_us: 0, shape: Vec::new(), aux: Vec::new(), dtype: 0, payload: Bytes::new() }
+    }
+
+    pub fn control_aux(msg_type: MsgType, seq: u32, aux: Vec<u32>) -> Self {
+        Frame { msg_type, seq, worker_compute_us: 0, shape: Vec::new(), aux, dtype: 0, payload: Bytes::new() }
     }
 
     pub fn from_tensor(msg_type: MsgType, seq: u32, t: &Tensor) -> Self {
         let shape = t.shape.split(',').map(|s| s.parse().unwrap()).collect();
-        Frame { msg_type, seq, worker_compute_us: 0, shape, dtype: 0, payload: t.data.clone() }
+        Frame { msg_type, seq, worker_compute_us: 0, shape, aux: Vec::new(), dtype: 0, payload: t.data.clone() }
     }
 
     pub fn into_tensor(self) -> Tensor {
@@ -66,6 +87,10 @@ where
     header.push(f.shape.len() as u8); // ndim
     for &d in &f.shape {
         header.extend_from_slice(&d.to_be_bytes());
+    }
+    header.push(f.aux.len() as u8); // naux
+    for &a in &f.aux {
+        header.extend_from_slice(&a.to_be_bytes());
     }
     header.push(f.dtype);
     header.extend_from_slice(&(f.payload.len() as u64).to_be_bytes());
@@ -103,6 +128,15 @@ where
     }
 
     r.read_exact(&mut one).await?;
+    let naux = one[0] as usize;
+    let mut aux = Vec::with_capacity(naux);
+    for _ in 0..naux {
+        let mut a = [0u8; 4];
+        r.read_exact(&mut a).await?;
+        aux.push(u32::from_be_bytes(a));
+    }
+
+    r.read_exact(&mut one).await?;
     let dtype = one[0];
 
     let mut len_buf = [0u8; 8];
@@ -117,6 +151,6 @@ where
     let mut payload = vec![0u8; payload_len];
     r.read_exact(&mut payload).await?;
 
-    Ok(Frame { msg_type, seq, worker_compute_us, shape, dtype, payload: Bytes::from(payload) })
+    Ok(Frame { msg_type, seq, worker_compute_us, shape, aux, dtype, payload: Bytes::from(payload) })
 }
 

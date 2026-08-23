@@ -35,6 +35,28 @@ struct TokenIdsResponse {
 }
 
 #[derive(Deserialize)]
+struct AcceptResponse {
+    accepted: u32,
+    final_token: u32,
+}
+
+#[derive(Deserialize)]
+struct ScalarsResponse {
+    scalars: Vec<f32>,
+}
+
+#[derive(Deserialize)]
+struct AcceptScalarsResponse {
+    accepted: u32,
+    pos: u32,
+}
+
+#[derive(Deserialize)]
+struct FinalTokenResponse {
+    final_token: u32,
+}
+
+#[derive(Deserialize)]
 pub struct Info {
     pub start_layer: u32,
     pub end_layer: u32,
@@ -150,6 +172,120 @@ impl MlxClient {
             .error_for_status()?
             .json().await?;
         Ok(resp.token_ids)
+    }
+
+    pub async fn sample_seeded(&self, logits: &Tensor, temperature: f32, seed: u64) -> Result<u32> {
+        let resp: SampleResponse = self.http
+            .post(format!("{}/sample", self.base))
+            .query(&[("seed", seed)])
+            .query(&[("temperature", temperature)])
+            .header("X-Shape", &logits.shape)
+            .header("X-Dtype", "float16")
+            .body(logits.data.clone())
+            .send().await?
+            .error_for_status()?
+            .json().await?;
+        Ok(resp.token_id)
+    }
+
+    pub async fn draft_sample(&self, cur: u32, k: u32, temperature: f32, seed: u64) -> Result<Vec<u32>> {
+        let resp: TokenIdsResponse = self.http
+            .post(format!("{}/draft_sample", self.base))
+            .query(&[("cur", cur as u64), ("k", k as u64), ("seed", seed)])
+            .query(&[("temperature", temperature)])
+            .send().await?
+            .error_for_status()?
+            .json().await?;
+        Ok(resp.token_ids)
+    }
+
+    pub async fn verify_probs(&self, x: &Tensor, temperature: f32) -> Result<Tensor> {
+        let resp = self.http
+            .post(format!("{}/verify_probs", self.base))
+            .query(&[("temperature", temperature)])
+            .header("X-Shape", &x.shape)
+            .header("X-Dtype", "float16")
+            .body(x.data.clone())
+            .send().await?
+            .error_for_status()?;
+        Self::tensor_from_response(resp).await
+    }
+
+    pub async fn verify_accept(&self, hidden: &Tensor, x: &[u32], temperature: f32, seed: u64) -> Result<(u32, u32)> {
+        let x_csv = x.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",");
+        let resp: AcceptResponse = self.http
+            .post(format!("{}/verify_accept", self.base))
+            .query(&[("seed", seed)])
+            .query(&[("temperature", temperature)])
+            .query(&[("x", x_csv.as_str())])
+            .header("X-Shape", &hidden.shape)
+            .header("X-Dtype", "float16")
+            .body(hidden.data.clone())
+            .send().await?
+            .error_for_status()?
+            .json().await?;
+        Ok((resp.accepted, resp.final_token))
+    }
+
+    pub async fn accept(&self, p: &Tensor, temperature: f32, seed: u64) -> Result<(u32, u32)> {
+        let resp: AcceptResponse = self.http
+            .post(format!("{}/accept", self.base))
+            .query(&[("seed", seed)])
+            .query(&[("temperature", temperature)])
+            .header("X-Shape", &p.shape)
+            .header("X-Dtype", "float32")
+            .body(p.data.clone())
+            .send().await?
+            .error_for_status()?
+            .json().await?;
+        Ok((resp.accepted, resp.final_token))
+    }
+
+    pub async fn verify_scalars(&self, hidden: &Tensor, x: &[u32], temperature: f32) -> Result<Vec<f32>> {
+        let x_csv = x.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",");
+        let resp: ScalarsResponse = self.http
+            .post(format!("{}/verify_scalars", self.base))
+            .query(&[("temperature", temperature.to_string().as_str()), ("x", x_csv.as_str())])
+            .header("X-Shape", &hidden.shape)
+            .header("X-Dtype", "float16")
+            .body(hidden.data.clone())
+            .send().await?
+            .error_for_status()?
+            .json().await?;
+        Ok(resp.scalars)
+    }
+
+    pub async fn logits_at(&self, pos: u32) -> Result<Tensor> {
+        let resp = self.http
+            .post(format!("{}/logits_at", self.base))
+            .query(&[("pos", pos)])
+            .send().await?
+            .error_for_status()?;
+        Self::tensor_from_response(resp).await
+    }
+
+    pub async fn accept_scalars(&self, px: &[f32], seed: u64) -> Result<(u32, u32)> {
+        let resp: AcceptScalarsResponse = self.http
+            .post(format!("{}/accept_scalars", self.base))
+            .query(&[("seed", seed)])
+            .json(&serde_json::json!({ "px": px }))
+            .send().await?
+            .error_for_status()?
+            .json().await?;
+        Ok((resp.accepted, resp.pos))
+    }
+
+    pub async fn resample_at(&self, p_row: &Tensor, pos: u32) -> Result<u32> {
+        let resp: FinalTokenResponse = self.http
+            .post(format!("{}/resample_at", self.base))
+            .query(&[("pos", pos)])
+            .header("X-Shape", &p_row.shape)
+            .header("X-Dtype", "float32")
+            .body(p_row.data.clone())
+            .send().await?
+            .error_for_status()?
+            .json().await?;
+        Ok(resp.final_token)
     }
 
     pub async fn trim(&self, n: u32) -> Result<()> {

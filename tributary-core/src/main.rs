@@ -51,6 +51,12 @@ struct Args {
 
     #[arg(long)]
     draft_model: Option<String>,
+
+    #[arg(long, default_value_t = 0)]
+    spec_seed: u64,
+
+    #[arg(long, default_value_t = 0.0)]
+    draft_temp: f32,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -126,6 +132,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match args.mode {
         Mode::Single if args.spec_k > 0 => run_spec_loop(&args).await,
         Mode::Single => run_loop(&args).await,
+        Mode::Coordinator if args.spec_k > 0 => run_spec_coordinator(&args).await,
         Mode::Coordinator => run_coordinator(&args).await,
         Mode::Worker => run_worker(&args).await,
     }
@@ -146,16 +153,21 @@ async fn run_spec_loop(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
     let ht = target.forward(&target.embed(&ids).await?, "prefill").await?;
     let _ = draft.forward(&draft.embed(&ids).await?, "prefill").await?;
-    let mut cur = *target
-        .argmax(&ht)
-        .await?
-        .last()
-        .ok_or("empty prefill argmax")?;
+    let temp = args.temperature;
+    let mut cur = if temp > 0.0 {
+        target.sample_seeded(&target.logits(&ht).await?, temp, args.spec_seed).await?
+    } else {
+        *target.argmax(&ht).await?.last().ok_or("empty prefill argmax")?
+    };
+
+    let draft_temp = args.draft_temp;
+    let sampled_draft = temp > 0.0 && draft_temp > 0.0;
 
     let mut rounds: u64 = 0;
     let mut accepted_sum: u64 = 0;
     let mut draft_us: u128 = 0;
     let mut verify_us: u128 = 0;
+    let mut verify_ret_bytes: u128 = 0;
     let mut token_count: u32 = 1;
 
     print!("{}", target.detokenize(&[cur]).await?);
@@ -164,8 +176,14 @@ async fn run_spec_loop(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
     if cur != eos {
         'outer: while token_count < args.max_tokens {
+            let seed = args.spec_seed.wrapping_add(rounds);
+
             let t_d = Instant::now();
-            let x = draft.draft(cur, k).await?;
+            let x = if sampled_draft {
+                draft.draft_sample(cur, k, draft_temp, seed).await?
+            } else {
+                draft.draft(cur, k).await?
+            };
             draft_us += t_d.elapsed().as_micros();
 
             let t_v = Instant::now();
@@ -173,15 +191,29 @@ async fn run_spec_loop(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             verify_ids.push(cur);
             verify_ids.extend_from_slice(&x);
             let h = target.forward(&target.embed(&verify_ids).await?, "decode").await?;
-            let t = target.argmax(&h).await?;
+
+            let (a, final_tok): (usize, u32) = if temp == 0.0 {
+                let t = target.argmax(&h).await?;
+                let mut na = 0usize;
+                while na < k as usize && t[na] == x[na] {
+                    na += 1;
+                }
+                verify_ret_bytes += ((k as usize + 1) * 4) as u128;
+                (na, t[na])
+            } else if sampled_draft {
+                let p = target.verify_probs(&h, temp).await?;
+                verify_ret_bytes += p.data.len() as u128;
+                let (na, ft) = draft.accept(&p, temp, seed).await?;
+                (na as usize, ft)
+            } else {
+                let (na, ft) = target.verify_accept(&h, &x, temp, seed).await?;
+                verify_ret_bytes += 8;
+                (na as usize, ft)
+            };
             verify_us += t_v.elapsed().as_micros();
 
-            let mut a = 0usize;
-            while a < k as usize && t[a] == x[a] {
-                a += 1;
-            }
             let mut emitted: Vec<u32> = x[..a].to_vec();
-            emitted.push(t[a]);
+            emitted.push(final_tok);
 
             let trim = k - a as u32;
             target.trim(trim).await?;
@@ -203,20 +235,21 @@ async fn run_spec_loop(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let elapsed = t_first.elapsed().as_secs_f32();
-    let gen_tokens = token_count.saturating_sub(1); // tokens after #0, comparable to baseline
+    let gen_tokens = token_count.saturating_sub(1);
     let alpha = if rounds > 0 { accepted_sum as f64 / (rounds as f64 * k as f64) } else { 0.0 };
     let mean_acc = if rounds > 0 { gen_tokens as f64 / rounds as f64 } else { 0.0 };
     eprintln!("\n");
     eprintln!(
-        "tributary (spec K={k}) | {token_count} tokens | {:.1} tok/s | ttft: {:.2}s",
+        "tributary (spec K={k} T={temp} draft_T={draft_temp}) | {token_count} tokens | {:.1} tok/s | ttft: {:.2}s",
         if elapsed > 0.0 { gen_tokens as f32 / elapsed } else { 0.0 },
         (t_first - t_start).as_secs_f32()
     );
     eprintln!(
         "spec | rounds={rounds} accept_rate α={alpha:.3} mean_accepted/verify={mean_acc:.2} | \
-         draft={}µs verify={}µs (mean/round)",
+         draft={}µs verify={}µs verify_ret={}B (mean/round)",
         if rounds > 0 { draft_us / rounds as u128 } else { 0 },
         if rounds > 0 { verify_us / rounds as u128 } else { 0 },
+        if rounds > 0 { verify_ret_bytes / rounds as u128 } else { 0 },
     );
     Ok(())
 }
@@ -273,16 +306,14 @@ async fn run_loop (args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn run_coordinator(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
-    let prompt = args.prompt.as_ref().ok_or("coordinator requires --prompt")?;
-    let worker_addr = args.worker.as_ref().ok_or("coordinator requires --worker")?;
-    let local = MlxClient::new(args.mlx_server.clone());
-    let mut stream: TcpStream = TcpStream::connect(worker_addr).await?;
-    let mut seq: u32 = 0;
-
+async fn validate_split(
+    stream: &mut TcpStream,
+    local: &MlxClient,
+    seq: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
     let coord = local.info().await?;
-    write_frame(&mut stream, &Frame::control(MsgType::Info, seq)).await?;
-    let winfo = read_frame(&mut stream).await?;
+    write_frame(stream, &Frame::control(MsgType::Info, seq)).await?;
+    let winfo = read_frame(stream).await?;
     if winfo.msg_type != MsgType::Info || winfo.shape.len() != 3 {
         return Err("worker sent a malformed Info reply".into());
     }
@@ -315,6 +346,166 @@ async fn run_coordinator(args: &Args) -> Result<(), Box<dyn std::error::Error>> 
         "split OK: coordinator 0..{} + worker {}..{} = {} layers",
         coord.end_layer, worker_start, worker_end, worker_num
     );
+    Ok(())
+}
+
+async fn run_spec_coordinator(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    let prompt = args.prompt.as_ref().ok_or("coordinator requires --prompt")?;
+    let worker_addr = args.worker.as_ref().ok_or("coordinator requires --worker")?;
+    let draft_url = args.draft_model.as_ref().ok_or("--spec-k requires --draft-model")?;
+    let k = args.spec_k;
+    let temp = args.temperature;
+    let draft_temp = args.draft_temp;
+    let sampled = temp > 0.0;
+    if sampled && draft_temp <= 0.0 {
+        return Err("distributed spec with temperature>0 requires --draft-temp>0 (sampled draft for the lazy return)".into());
+    }
+    let local = MlxClient::new(args.mlx_server.clone());
+    let draft = MlxClient::new(draft_url.clone());
+    let mut stream: TcpStream = TcpStream::connect(worker_addr).await?;
+    let mut seq: u32 = 0;
+
+    validate_split(&mut stream, &local, seq).await?;
+    seq += 1;
+
+    local.reset().await?;
+    draft.reset().await?;
+    write_frame(&mut stream, &Frame::control(MsgType::ResetCache, seq)).await?;
+    seq += 1;
+
+    let (ids, eos_token_id) = local.tokenize(prompt).await?;
+    let t_start = Instant::now();
+
+    let hidden = local.forward(&local.embed(&ids).await?, "prefill").await?;
+    let mut cur = {
+        write_frame(&mut stream, &Frame::from_tensor(MsgType::Prefill, seq, &hidden)).await?;
+        let logits = recv_logits(&mut stream, seq).await?.into_tensor();
+        seq += 1;
+        if sampled {
+            local.sample_seeded(&logits, temp, args.spec_seed).await?
+        } else {
+            local.sample(&logits, 0.0).await?
+        }
+    };
+    let _ = draft.forward(&draft.embed(&ids).await?, "prefill").await?;
+
+    let mut rounds: u64 = 0;
+    let mut accepted_sum: u64 = 0;
+    let mut token_count: u32 = 1;
+    let mut timings: Vec<StepTiming> = Vec::new();
+    let mut return_bytes: u128 = 0;
+
+    print!("{}", local.detokenize(&[cur]).await?);
+    std::io::stdout().flush()?;
+    let t_first = Instant::now();
+
+    if cur != eos_token_id {
+        'outer: while token_count < args.max_tokens {
+            let seed = args.spec_seed.wrapping_add(rounds);
+
+            let t_d = Instant::now();
+            let x = if sampled {
+                draft.draft_sample(cur, k, draft_temp, seed).await?
+            } else {
+                draft.draft(cur, k).await?
+            };
+            let draft_us = t_d.elapsed().as_micros();
+
+            let t_local = Instant::now();
+            let mut verify_ids = Vec::with_capacity(x.len() + 1);
+            verify_ids.push(cur);
+            verify_ids.extend_from_slice(&x);
+            let h = local.forward(&local.embed(&verify_ids).await?, "decode").await?;
+            let local_us = t_local.elapsed().as_micros() + draft_us;
+
+            let (a, final_tok, mut vt) = if sampled {
+                let mut aux_out = Vec::with_capacity(x.len() + 1);
+                aux_out.push(temp.to_bits());
+                aux_out.extend_from_slice(&x);
+                let (bits, vt) = verify_exchange(&mut stream, &h, aux_out, seq).await?;
+                seq += 1;
+                let px: Vec<f32> = bits.iter().map(|b| f32::from_bits(*b)).collect();
+                return_bytes += (px.len() * 4) as u128;
+                let (a, pos) = draft.accept_scalars(&px, seed).await?;
+                let (p_row, worker2_us, bytes2) = logits_at_exchange(&mut stream, pos, seq).await?;
+                seq += 1;
+                return_bytes += bytes2 as u128;
+                let final_tok = draft.resample_at(&p_row, pos).await?;
+                let mut vt = vt;
+                vt.worker_us += worker2_us;
+                (a as usize, final_tok, vt)
+            } else {
+                let (t, vt) = verify_exchange(&mut stream, &h, Vec::new(), seq).await?;
+                seq += 1;
+                return_bytes += (t.len() * 4) as u128;
+                let mut a = 0usize;
+                while a < k as usize && t[a] == x[a] {
+                    a += 1;
+                }
+                (a, t[a], vt)
+            };
+
+            let mut emitted: Vec<u32> = x[..a].to_vec();
+            emitted.push(final_tok);
+
+            let trim = k - a as u32;
+            local.trim(trim).await?;
+            draft.trim(trim).await?;
+            write_frame(&mut stream, &Frame::control_aux(MsgType::Trim, seq, vec![trim])).await?;
+            seq += 1;
+
+            vt.local_us = local_us;
+            timings.push(vt);
+            rounds += 1;
+            accepted_sum += a as u64;
+
+            for &tok in &emitted {
+                print!("{}", local.detokenize(&[tok]).await?);
+                std::io::stdout().flush()?;
+                token_count += 1;
+                cur = tok;
+                if tok == eos_token_id || token_count >= args.max_tokens {
+                    break 'outer;
+                }
+            }
+        }
+    }
+
+    let elapsed = t_first.elapsed().as_secs_f32();
+    let gen_tokens = token_count.saturating_sub(1);
+    let alpha = if rounds > 0 { accepted_sum as f64 / (rounds as f64 * k as f64) } else { 0.0 };
+    let mean_acc = if rounds > 0 { gen_tokens as f64 / rounds as f64 } else { 0.0 };
+    eprintln!("\n");
+    eprintln!(
+        "tributary (spec-coordinator K={k} T={temp} draft_T={draft_temp}) | {token_count} tokens | {:.1} tok/s | ttft: {:.2}s",
+        if elapsed > 0.0 { gen_tokens as f32 / elapsed } else { 0.0 },
+        (t_first - t_start).as_secs_f32()
+    );
+    eprintln!(
+        "spec | rounds={rounds} accept_rate α={alpha:.3} mean_accepted/verify={mean_acc:.2} | \
+         verify_ret={}B/round round_trips/tok={:.3}",
+        if rounds > 0 { return_bytes / rounds as u128 } else { 0 },
+        if gen_tokens > 0 { rounds as f64 / gen_tokens as f64 } else { 0.0 },
+    );
+    if !timings.is_empty() {
+        let prefill = StepTiming::default();
+        print_timing_summary(&prefill, &timings);
+    }
+    if let Some(path) = &args.timing_csv {
+        write_timing_csv(path, &StepTiming::default(), &timings)?;
+        eprintln!("wrote timing CSV to {path}");
+    }
+    Ok(())
+}
+
+async fn run_coordinator(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    let prompt = args.prompt.as_ref().ok_or("coordinator requires --prompt")?;
+    let worker_addr = args.worker.as_ref().ok_or("coordinator requires --worker")?;
+    let local = MlxClient::new(args.mlx_server.clone());
+    let mut stream: TcpStream = TcpStream::connect(worker_addr).await?;
+    let mut seq: u32 = 0;
+
+    validate_split(&mut stream, &local, seq).await?;
     seq += 1;
 
     local.reset().await?;
@@ -420,6 +611,55 @@ async fn recv_logits(stream: &mut TcpStream, expected_seq: u32) -> Result<Frame,
     Ok(frame)
 }
 
+async fn verify_exchange(
+    stream: &mut TcpStream,
+    hidden: &Tensor,
+    aux_out: Vec<u32>,
+    seq: u32,
+) -> Result<(Vec<u32>, StepTiming), Box<dyn std::error::Error>> {
+    let mut t = StepTiming::default();
+
+    let t_ser = Instant::now();
+    let mut frame_out = Frame::from_tensor(MsgType::Verify, seq, hidden);
+    frame_out.aux = aux_out;
+    t.serialize_us = t_ser.elapsed().as_micros();
+    t.activation_bytes = frame_out.payload.len();
+
+    let t_rt = Instant::now();
+    write_frame(stream, &frame_out).await?;
+    let reply = read_frame(stream).await?;
+    t.roundtrip_us = t_rt.elapsed().as_micros();
+    if reply.msg_type != MsgType::VerifyResult {
+        return Err(format!("expected VerifyResult frame, got {:?}", reply.msg_type).into());
+    }
+    if reply.seq != seq {
+        return Err(format!("seq mismatch: sent {seq}, got {}", reply.seq).into());
+    }
+    t.worker_us = reply.worker_compute_us as u128;
+    t.network_us = t.roundtrip_us.saturating_sub(t.worker_us);
+    t.logits_bytes = reply.aux.len() * 4;
+
+    Ok((reply.aux, t))
+}
+
+async fn logits_at_exchange(
+    stream: &mut TcpStream,
+    pos: u32,
+    seq: u32,
+) -> Result<(Tensor, u128, usize), Box<dyn std::error::Error>> {
+    write_frame(stream, &Frame::control_aux(MsgType::LogitsAt, seq, vec![pos])).await?;
+    let reply = read_frame(stream).await?;
+    if reply.msg_type != MsgType::Logits {
+        return Err(format!("expected Logits frame, got {:?}", reply.msg_type).into());
+    }
+    if reply.seq != seq {
+        return Err(format!("seq mismatch: sent {seq}, got {}", reply.seq).into());
+    }
+    let worker_us = reply.worker_compute_us as u128;
+    let bytes = reply.payload.len();
+    Ok((reply.into_tensor(), worker_us, bytes))
+}
+
 async fn run_worker(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let port = args.listen.ok_or("worker requires --listen")?;
     let local = MlxClient::new(args.mlx_server.clone());
@@ -449,6 +689,10 @@ async fn run_worker(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                 MsgType::ResetCache => {
                     local.reset().await?;
                 }
+                MsgType::Trim => {
+                    let n = frame.aux.first().copied().unwrap_or(0);
+                    local.trim(n).await?;
+                }
                 MsgType::Prefill | MsgType::DecodeStep => {
                     let seq = frame.seq;
                     let mode = if frame.msg_type == MsgType::Prefill { "prefill" } else { "decode" };
@@ -463,8 +707,38 @@ async fn run_worker(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                     reply.worker_compute_us = compute_us;
                     write_frame(&mut stream, &reply).await?;
                 }
-                MsgType::Logits => {
-                    return Err("worker received an unexpected Logits frame".into());
+                MsgType::Verify => {
+                    let seq = frame.seq;
+                    let aux = frame.aux.clone();
+                    let t_compute = Instant::now();
+                    let hidden = local.forward(&frame.into_tensor(), "decode").await?;
+                    let result_aux = if aux.is_empty() {
+                        local.argmax(&hidden).await?
+                    } else {
+                        let temp = f32::from_bits(aux[0]);
+                        let x: Vec<u32> = aux[1..].to_vec();
+                        local.verify_scalars(&hidden, &x, temp).await?
+                            .iter().map(|s| s.to_bits()).collect()
+                    };
+                    let compute_us = t_compute.elapsed().as_micros() as u64;
+
+                    let mut reply = Frame::control_aux(MsgType::VerifyResult, seq, result_aux);
+                    reply.worker_compute_us = compute_us;
+                    write_frame(&mut stream, &reply).await?;
+                }
+                MsgType::LogitsAt => {
+                    let seq = frame.seq;
+                    let pos = frame.aux.first().copied().unwrap_or(0);
+                    let t_compute = Instant::now();
+                    let row = local.logits_at(pos).await?;
+                    let compute_us = t_compute.elapsed().as_micros() as u64;
+
+                    let mut reply = Frame::from_tensor(MsgType::Logits, seq, &row);
+                    reply.worker_compute_us = compute_us;
+                    write_frame(&mut stream, &reply).await?;
+                }
+                MsgType::Logits | MsgType::VerifyResult => {
+                    return Err(format!("worker received an unexpected {:?} frame", frame.msg_type).into());
                 }
             }
         }

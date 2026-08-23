@@ -305,10 +305,275 @@ accepted/verify rises but sub-linearly). α is higher on structured/repetitive p
   rewrite. New primitives: `PartialModel.{draft_generate, greedy_all, trim}`, endpoints
   `/draft` `/argmax` `/trim`, Rust `run_spec_loop`.
 
-## Next (Milestone A → temp>0 exact, then B)
+---
 
-Greedy only so far. **Next step: temp>0 *exact*** — draft returns full `q` distributions,
-residual resampling `norm(max(0, p−q))` at the reject point, seeded-RNG statistical
-acceptance check (exactness is statistical, not byte-level, there). Then the §1.3 lazy-logits
-return and the distributed Milestone B (`Trim` TCP frame, draft-on-coordinator). The greedy
-scaffolding here is the reusable base for all of it.
+# Step 3 — Speculative Decoding, Milestone A (temp>0, **exact**)
+
+Same hardware / model pair, Aug 20 2026. Extends greedy spec to full Leviathan sampling.
+
+The draft now **samples** K tokens from `q` at temperature T (seeded) and keeps its
+distributions; the target returns per-position `p` at T (`/verify_probs`, fp32); the
+**accept/reject + residual resampling runs on the draft server** (`/accept`), which is where
+`q` lives — this is the B-aligned placement (in Milestone B the draft is the
+coordinator-local model and §1.3 has the accept test run there). Rust plumbs the tensors and
+coordinates the same symmetric `K−a` trim as greedy. Accept x_j iff `r < min(1, p_j(x_j)/q_j(x_j))`;
+at first reject resample from `norm(max(0, p_j − q_j))`; if all K accepted, free bonus from `p_K`.
+New flag `--spec-seed` (per-round seed = base + round); token #0 is a seeded target sample.
+
+## Exactness — proof + statistical gate ✅
+
+**Algebraic:** for the first emitted position, `P(emit y) = min(q(y),p(y)) + max(0, p(y)−q(y)) = p(y)` —
+the output is exactly the target distribution, independent of the draft. So the correctness gate
+is statistical (not byte-level, as with greedy).
+
+**Empirical:** fix a context, compute the target's exact `p*`, run N spec rounds, compare the
+empirical distribution of the emitted token to `p*` via total-variation distance — against a
+noise floor = expected TV of N *direct* multinomial draws from `p*`. Spec is exact iff
+`TV(spec) ≈ TV(direct)`.
+
+| T | N | TV(spec, p*) | noise floor | ratio | verdict |
+|---|---|---|---|---|---|
+| 0.3 | 400 | 0.0052 | 0.0245 | 0.21 | within floor ✅ |
+| 0.8 | 400 | 0.0216 | 0.0421 | 0.51 | within floor ✅ |
+| 1.0 | 700 | 0.0267 | 0.0507 | 0.53 | within floor ✅ |
+
+Every ratio ≤ 1 — spec's deviation from `p*` is no larger than pure sampling noise. (At T=1.0,
+N=200 gave a misleading ratio 1.68; raising N→700 dropped it to 0.53, confirming it was small-N
+noise on the flatter high-temp distribution, exactly as the proof predicts.)
+
+## Reproducibility + α
+
+- **Seeded → reproducible:** same `--spec-seed` twice → byte-identical transcript; different seed
+  → different text. (Greedy determinism was byte-identical to baseline; temp>0 determinism is
+  per-seed.)
+- **α across 5 seeds** (T=0.8, K=4, real story-continuation prompt): 0.44, 0.49, 0.54, 0.63, 0.49
+  — stable ~0.5, spread is just different sampled trajectories. mean accepted/verify ≈ 2.7–3.4.
+- Perf tracks the greedy finding: ~24 tok/s at T=0.8 K=4 (draft compute still dominates
+  single-node; the win is distributed / zero-compute-draft, per the greedy notes).
+
+## Notes / honesty
+
+- **A ships the full `p` [K+1, vocab] fp32** target→coordinator each round (localhost, cheap —
+  correctness milestone). Milestone B replaces this with §1.3's lazy return (K scalars `p_i(x_i)`
+  + one full distribution at the reject point) so the slow WiFi link isn't hit with K×256 KB.
+- New primitives: `PartialModel.{draft_sample, spec_accept, verify_probs}`, seeded `sample_token`;
+  endpoints `/draft_sample` `/verify_probs` `/accept`; fp32 tensor support; Rust
+  `{draft_sample, verify_probs, accept, sample_seeded}` + temp>0 branch in `run_spec_loop`.
+
+## Next
+
+§1.3 lazy-logits return, then distributed **Milestone B** (`Trim` TCP frame,
+draft-on-coordinator, verify across the pipeline). The single-node greedy + exact-sampling
+machinery here is the reusable base for both.
+
+---
+
+# Step 3 — Greedy-draft speculative sampling (lazy accept-on-verifier)
+
+Same hardware / model pair, Aug 23 2026. New `--draft-temp` flag (default **0**);
+`--temperature` is the target temp as before. This is §1.3's lazy return, made trivial.
+
+**Idea.** Force the **draft to temp 0** (argmax). Then `q_j` is a point mass on the drafted
+token `m_j`, and Leviathan collapses: accept iff `r < p_j(m_j)` (a scalar), and the reject
+resample is just **`p_j` with `m_j` zeroed and renormalized** (`norm(max(0,p−q))` with a
+point-mass `q`). Marginal is still exactly `p` (`P(emit m_j)=p_j(m_j)`,
+`P(emit y≠m_j)=p_j(y)`). Because the verifier already knows the drafted ids, it runs the whole
+accept+resample itself and **returns just `(accepted, final_token)` — no `q`, no distribution
+on the wire.** For `--draft-temp > 0` the old sampled-draft path (ships full `p`) still runs.
+
+## Deliverable 1 — network return per token: greedy vs shipping a distribution
+
+**Why temp 0 is special:** the reject resample `norm(max(0,p−q))` needs `q`. For any
+`draft-temp>0`, `q` lives on the draft, so ≥1 full distribution must cross the wire (the
+verifier can't resample alone). At `draft-temp=0`, `q` is known, so the verifier resamples and
+returns one token id. Measured `verify_ret` per round: **greedy = 8 B**, sampled =
+**2,565,120 B** (= (K+1)·V·4, K=4, V=128 256, fp32) — confirmed on the wire.
+
+Per **emitted** token (÷ measured mean-accepted/verify `T_round`), for our V=128 256 pair:
+
+| target T | sampled T_round | naive (K+1 fp32) | lazy min (1 fp32) | lazy min (1 fp16) | greedy |
+|---|---|---|---|---|---|
+| 0.3 | 2.97 | 843 KB/tok | 169 KB/tok | 84 KB/tok | ~3 B/tok |
+| 0.7 | 2.88 | 870 KB/tok | 174 KB/tok | 87 KB/tok | ~4 B/tok |
+| 1.0 | 2.71 | 924 KB/tok | 185 KB/tok | 92 KB/tok | ~4 B/tok |
+
+Greedy eliminates essentially the entire return: ~**850 KB/token** vs the current impl, ~**170
+KB/token** vs the best *exact* lazy scheme (fp32, 1 distribution). For scale, the pipeline's
+forward activation is ~10 KB/token — the returned distribution is 8–90× larger.
+
+**Generalizes by vocab** (one distribution = `V·b`; per-token = `V·b / T_round`):
+
+| Model family | V | fp16 dist | fp32 dist |
+|---|---|---|---|
+| Llama-2 / Mistral-7B | 32,000 | 62 KB | 125 KB |
+| GPT-2 / Pythia | ~50,300 | 98 KB | 196 KB |
+| Llama-3.x (ours) | 128,256 | 250 KB | 501 KB |
+| Mistral-Small-24B (repo) | 131,072 | 256 KB | 512 KB |
+| Qwen2.5 | 151,936 | 297 KB | 594 KB |
+| Gemma-2/3 | 256,000 | 500 KB | 1000 KB |
+
+**WiFi projection** (from the two-node data: 256 KB fp16 ≈ 28 ms one-way), pure return time:
+
+| scheme | return/round | return/token |
+|---|---|---|
+| naive (5 fp32 dists, current) | ~274 ms | **~96 ms/tok** |
+| lazy fp32 (1 dist) | ~55 ms | ~19 ms/tok |
+| lazy fp16 (1 dist) | ~27 ms | ~10 ms/tok |
+| **greedy (2 ints)** | ~0 ms | **~0 ms/tok** |
+
+Since per-token compute here is ~50 ms, the distribution return is a 0.2–2× latency tax on a
+WiFi link that greedy erases entirely.
+
+## Deliverable 2 — acceptance rate vs draft temperature
+
+Prompt fixed, K=4, `--spec-seed 1`, warm. α (and mean accepted/verify) as `--draft-temp` sweeps
+under each target `T`:
+
+| target T \ draft T | 0 (greedy) | 0.3 | 0.7 | 1.0 |
+|---|---|---|---|---|
+| 0.3 | α 0.372 / 2.44 | **0.523 / 2.97** | 0.382 / 2.50 | 0.436 / 2.71 |
+| 0.7 | α 0.290 / 2.16 | 0.356 / 2.38 | **0.485 / 2.88** | 0.470 / 2.88 |
+| 1.0 | α 0.245 / 1.98 | 0.129 / 1.48 | 0.375 / 2.50 | **0.429 / 2.71** |
+
+α is **maximized when the draft temp matches the target temp** (bold), consistent with
+`α = 1 − TV(p_target@T, q_draft@Td)`. Greedy draft (Td=0) always proposes the mode, so it
+gives up α vs the temp-matched draft — the price of zero `q`-bandwidth. A mismatched non-zero
+draft temp can be *worse* than greedy (e.g. T=1.0, Td=0.3 → α 0.129). **(Single prompt / seed —
+generalized below.)**
+
+### Multi-prompt validation (5 prompts × 3 seeds × 3 temps, greedy vs temp-matched)
+
+The greedy-vs-matched α **gap is not a constant** — it grows with temperature and shrinks on
+structured text:
+
+| target T | mean gap | std | min | max |
+|---|---|---|---|---|
+| 0.3 | **−0.018** | 0.100 | −0.200 | 0.151 |
+| 0.7 | +0.134 | 0.151 | −0.093 | 0.345 |
+| 1.0 | +0.257 | 0.171 | −0.032 | 0.626 |
+| all | +0.124 | 0.183 | −0.200 | 0.626 |
+
+At low temp greedy essentially **ties** matched (the draft's argmax is usually the target's
+mode); at high temp it gives up ~0.26. Per prompt (avg over seeds/temps): repetitive **+0.059**,
+reasoning **+0.068**, factual +0.146, prose +0.162, code **+0.185** — structured/repetitive text
+costs greedy almost nothing; creative/code costs most. So the earlier single-prompt "~0.18" was
+a mid-temp/prose point, not representative.
+
+## The honest single-node result
+
+On **localhost** the 2.5 MB return costs only ~5 ms/round, so the α loss dominates and greedy
+is a **net loss**: tok/s at (T, greedy vs temp-matched) = 0.3: 20.6 vs 23.9 · 0.7: 18.3 vs 23.6
+· 1.0: 16.6 vs 22.0. **Greedy draft is a bandwidth optimization, not a single-node one** — its
+whole payoff is the network return it removes, which only bites on a real link. Projected on
+WiFi it flips: greedy ≈ 19 tok/s vs ~7 (naive) / ~17–20 (lazy), while being simpler (no `q`
+state, accept fully on the verifier, exact — no fp16-on-wire approximation).
+
+## Break-even vs the lazy-logits method (how much α greedy may give up)
+
+Greedy trades acceptance rate for return bandwidth. When is that trade worth it vs the exact
+lazy method (draft-temp>0, returns K scalars + 1 distribution)? Per-token time in a synchronous
+round (emits `T=αK+1` tokens): `t=(C+R)/(αK+1)`, with `C` the per-round cost common to both
+(draft + target forward + activation send) and `R` the worker→coordinator return — the only
+difference (greedy `R_g≈0`; lazy `R_L≈` one distribution). Setting `t_greedy ≤ t_lazy`:
+
+```
+Δα_max = [ ΔR / (C + R_L) ] · (α_L + 1/K),   ΔR = R_L − R_g ≈ one-distribution transfer
+```
+
+Greedy's tolerable α **drop** scales with the fraction of the round spent shipping the
+distribution. With measured inputs (`C≈117 ms/round`, `α_L≈0.5`, `K=4`; transfer from the
+two-node data: 256 KB fp16 ≈ 28 ms WiFi, ~1 ms Thunderbolt):
+
+| link / dtype | ΔR | Δα_max | vs observed drop ≈ 0.18 |
+|---|---|---|---|
+| localhost / Thunderbolt | 0.5–2 ms | 0.003–0.013 | greedy loses badly |
+| WiFi, fp16 lazy (approx) | 28 ms | 0.145 | ~tie / slight loss |
+| **WiFi, fp32 lazy (exact)** | 56 ms | **0.243** | **greedy wins** |
+
+**Threshold:** against the *exact* lazy method (which must ship fp32), greedy tolerates an α
+drop of up to **~0.24** on WiFi (≈ one accepted token/round, `K·Δα≈1`) — collapsing to ~0.01 on
+Thunderbolt/localhost. Sensitivity to compute: `Δα_max` = 0.36 at `C=60 ms`, 0.16 at
+`C=200 ms` (WiFi fp32) — faster compute favors greedy.
+
+**Verdict, evaluated per-case on the multi-prompt sweep** (projecting WiFi per-token time from
+each case's *measured* `T_round`, `C=117 ms`, fp32 return 56 ms / fp16 28 ms):
+
+| vs lazy | greedy wins | mean proj tok/s (greedy vs lazy) |
+|---|---|---|
+| exact (fp32) | **34/45 (76%)** | **25.6 vs 20.0** |
+| approx (fp16) | 26/45 (58%) | 25.6 vs 23.8 |
+
+Per temp (WiFi proj tok/s, greedy / lazy-fp32 / lazy-fp16): T=0.3 **31.4 / 20.8 / 24.8** · T=0.7
+**25.5 / 20.1 / 24.0** · T=1.0 **19.8 / 19.0 / 22.7**. So **greedy clearly wins vs the exact
+lazy method at low–mid temperature and on structured prompts**, narrowing to a tie at T=1.0
+(where its α gap balloons to ~0.26). Against an *approximate* fp16 lazy it's roughly a wash
+(and loses at T=1.0) — but greedy stays exact and simpler (no `q` state, accept fully on the
+verifier). On Thunderbolt/localhost greedy loses everywhere (return is nearly free). Caveat:
+assumes a synchronous pipeline; async overlap (Milestone C) would hide `R` and shrink greedy's
+edge.
+
+## Correctness
+
+- **Exactness of the greedy-draft path — confirmed.** Empirical first-emitted-token
+  distribution vs the target's exact `p*`, TV distance as a z-score against the
+  direct-multinomial noise floor: T=0.3 z=0.60 (N=800), T=1.0 z=1.70 (N=800), T=0.8 z=0.39
+  (N=2000). T=0.8 read z=2.22 at N=800 but **fell to 0.39 at N=2000** — a real bias grows with
+  √N, so shrinking confirms it was sampling noise. (`verify_accept` is algebraically identical
+  to the validated `spec_accept` with a point-mass `q`: `min(1,p/1)=p`, `max(0,p−δ)` = `p`
+  with the drafted id zeroed.)
+- **Reproducible:** same `--spec-seed` → byte-identical transcript.
+- **No regression:** `--temperature 0` still byte-identical to `baseline.out`.
+
+New primitives: `PartialModel.verify_accept`; endpoint `/verify_accept`; Rust
+`verify_accept` + `--draft-temp` + `verify_ret_bytes` instrumentation.
+
+## Next
+
+Milestone B makes this the worker-side primitive: worker runs verify+accept and returns
+`(a, final)` over TCP — the greedy-draft lazy return *is* the distributed win projected above.
+
+---
+
+# Step 3 — Milestone B: distributed speculative decoding (correctness, loopback)
+
+Draft runs entirely on the coordinator; the target is split coordinator-shard (layers 0..14) +
+worker-shard (14..28). Each round: draft K, forward all K+1 through the local shard, ship once to
+the worker, accept, roll back **all three** KV caches (draft, local shard, worker-over-TCP) by
+`k−a`. New TCP frames: `Trim`, `Verify`/`VerifyResult`, `LogitsAt` (+ a small `aux: Vec<u32>`
+side-channel on every frame). Dispatch: `--mode coordinator --spec-k K --draft-model <url>`.
+
+**All gates run as 4 processes on one M2 Air over loopback TCP** — a functional/correctness check,
+not a perf headline (all shards contend for one GPU). The two-Mac Thunderbolt/WiFi benchmark is
+deferred until after these pass.
+
+## Correctness
+
+- **Greedy (temp 0) — byte-identical to the non-spec two-node pipeline** (`run_coordinator`) across
+  3 prompts × K∈{1,2,4} (all 9 exact, 80 tokens each). Byte-identity across varying K (hence varying
+  accept counts) is also the cache-rollback proof: any `trim` desync across the three caches would
+  corrupt later tokens. Worker returns its per-position **argmax ids** — the greedy lazy return is
+  `(K+1)×4 = 20 B/round`, never the 256 KB logits the plain pipeline ships per token.
+- **Sampled (temp>0) — byte-identical to single-node `run_spec_loop`** across 2 prompts ×
+  {K∈{2,4}, T∈{0.8,0.3}}, seeded (`--spec-seed`). The two-phase lazy return
+  (`accept_scalars`→`logits_at`→`resample_at`) replicates `spec_accept`'s exact RNG stream, so
+  equality is byte-level, not just statistical.
+- **Reproducible:** same `--spec-seed` → identical transcript.
+
+## Wire (measured on loopback via the round stats)
+
+- Greedy K=4: α≈0.60, mean_accepted/verify≈3.3, **round_trips/tok≈0.30** (one worker round-trip per
+  ~3.3 emitted tokens vs exactly 1.0 for the non-spec pipeline), verify_ret **20 B/round**.
+- Sampled K=4 T=0.8: α≈0.50, mean_accepted/verify≈2.95, return **≈513 KB/round** = exactly **one**
+  full fp32 distribution (128256×4 B) + the K+1 scalars — vs the naive K+1 distributions (~2.5 MB).
+  The lazy return collapses the sampled return to one distribution per *round* instead of per *token*.
+
+New primitives: TCP `Trim`/`Verify`/`VerifyResult`/`LogitsAt` frames + `Frame.aux`;
+`run_spec_coordinator`, `verify_exchange`, `logits_at_exchange`, worker Verify/LogitsAt/Trim arms;
+`PartialModel.verify_scalars`/`logits_at`/`accept_scalars`/`resample_at`; endpoints
+`/verify_scalars`, `/logits_at`, `/accept_scalars`, `/resample_at`; client methods to match.
+
+## Next
+
+Two-Mac benchmark over Thunderbolt + WiFi: tok/s, α, round-trips/token, return-bytes/token vs the
+two-node pipeline baseline — the "worker idle time drops from ~65% to ~20%" number. Then the K-sweep
+per transport (optimal K rises as bandwidth falls), and fp16-on-the-wire for the sampled distribution.

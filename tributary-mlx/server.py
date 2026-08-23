@@ -9,18 +9,22 @@ from model import PartialModel
 app = FastAPI()
 model: PartialModel | None = None
 
+_NP_DTYPES = {"float16": np.float16, "float32": np.float32}
+_MX_DTYPES = {"float16": mx.float16, "float32": mx.float32}
+
 def tensor_from_request(body: bytes, shape_header: str, dtype_header: str) -> mx.array:
-    if dtype_header != "float16":
+    np_dtype = _NP_DTYPES.get(dtype_header)
+    if np_dtype is None:
         raise HTTPException(400, f"unsupported dtype: {dtype_header}")
     shape = tuple(int(d) for d in shape_header.split(","))
-    return mx.array(np.frombuffer(body, dtype=np.float16).reshape(shape))
+    return mx.array(np.frombuffer(body, dtype=np_dtype).reshape(shape))
 
-def tensor_response(x: mx.array) -> Response:
-    arr = np.array(x.astype(mx.float16))
+def tensor_response(x: mx.array, dtype: str = "float16") -> Response:
+    arr = np.array(x.astype(_MX_DTYPES[dtype]))
     return Response(
         content=arr.tobytes(),
         media_type="application/octet-stream",
-        headers={"X-Shape": ",".join(str(d) for d in arr.shape), "X-Dtype": "float16"},
+        headers={"X-Shape": ",".join(str(d) for d in arr.shape), "X-Dtype": dtype},
     )
 
 class DetokenizeRequest(BaseModel):
@@ -90,10 +94,65 @@ async def trim(n: int):
     model.trim(n)
     return {"ok": True}
 
+@app.post("/draft_sample")
+async def draft_sample(cur: int, k: int, temperature: float, seed: int):
+    if not model.is_first:
+        raise HTTPException(400, f"/draft_sample requires layer 0; this instance starts at {model.start_layer}")
+    return {"token_ids": model.draft_sample(cur, k, temperature, seed)}
+
+@app.post("/verify_probs")
+async def verify_probs(request: Request, temperature: float):
+    if not model.is_last:
+        raise HTTPException(400, f"/verify_probs requires the final layer ({model.num_layers}); this instance ends at {model.end_layer}")
+    x = tensor_from_request(await request.body(), request.headers.get("x-shape"), request.headers.get("x-dtype"))
+    return tensor_response(model.verify_probs(x, temperature), dtype="float32")
+
+@app.post("/accept")
+async def accept(request: Request, temperature: float, seed: int):
+    p = tensor_from_request(await request.body(), request.headers.get("x-shape"), request.headers.get("x-dtype"))
+    a, final_token = model.spec_accept(p, temperature, seed)
+    return {"accepted": a, "final_token": final_token}
+
+@app.post("/verify_scalars")
+async def verify_scalars(request: Request, temperature: float, x: str):
+    if not model.is_last:
+        raise HTTPException(400, f"/verify_scalars requires the final layer ({model.num_layers}); this instance ends at {model.end_layer}")
+    h = tensor_from_request(await request.body(), request.headers.get("x-shape"), request.headers.get("x-dtype"))
+    ids = [int(t) for t in x.split(",")]
+    return {"scalars": model.verify_scalars(h, ids, temperature)}
+
+@app.post("/logits_at")
+async def logits_at(pos: int):
+    if not model.is_last:
+        raise HTTPException(400, f"/logits_at requires the final layer ({model.num_layers}); this instance ends at {model.end_layer}")
+    return tensor_response(model.logits_at(pos), dtype="float32")
+
+class AcceptScalarsRequest(BaseModel):
+    px: list[float]
+
+@app.post("/accept_scalars")
+async def accept_scalars(req: AcceptScalarsRequest, seed: int):
+    a, pos = model.accept_scalars(req.px, seed)
+    return {"accepted": a, "pos": pos}
+
+@app.post("/resample_at")
+async def resample_at(request: Request, pos: int):
+    p_row = tensor_from_request(await request.body(), request.headers.get("x-shape"), request.headers.get("x-dtype"))
+    return {"final_token": model.resample_at(p_row, pos)}
+
+@app.post("/verify_accept")
+async def verify_accept(request: Request, temperature: float, seed: int, x: str):
+    if not model.is_last:
+        raise HTTPException(400, f"/verify_accept requires the final layer ({model.num_layers}); this instance ends at {model.end_layer}")
+    h = tensor_from_request(await request.body(), request.headers.get("x-shape"), request.headers.get("x-dtype"))
+    ids = [int(t) for t in x.split(",")]
+    a, final_token = model.verify_accept(h, ids, temperature, seed)
+    return {"accepted": a, "final_token": final_token}
+
 @app.post("/sample")
-async def sample(request: Request, temperature: float = 0.0):
+async def sample(request: Request, temperature: float = 0.0, seed: int | None = None):
     logits = tensor_from_request(await request.body(), request.headers.get("x-shape"), request.headers.get("x-dtype"))
-    return {"token_id": model.sample_token(logits, temperature)}
+    return {"token_id": model.sample_token(logits, temperature, seed)}
 
 class TokenizeRequest(BaseModel):
     text: str

@@ -11,6 +11,10 @@ class PartialModel:
         self.start_layer = start_layer
         self.end_layer = end_layer if end_layer is not None else self.num_layers
         self.cache = None
+        self._spec_x: list[int] | None = None
+        self._spec_q: mx.array | None = None
+        self._spec_key: mx.array | None = None
+        self._last_probs: mx.array | None = None
 
         if not (0 <= self.start_layer < self.end_layer <= self.num_layers):
             raise ValueError(
@@ -73,16 +77,143 @@ class PartialModel:
         toks = mx.argmax(logits, axis=-1)  # [1, T]
         return [int(t) for t in toks[0].tolist()]
 
+    def draft_sample(self, cur: int, k: int, temperature: float, seed: int) -> list[int]:
+        assert self.cache is not None
+        key = mx.random.key(2 * seed)
+        xs: list[int] = []
+        q_rows: list[mx.array] = []
+        tok = cur
+        for _ in range(k):
+            logits = self.decode_logits(self.decode_step(self.embed([tok])))[0, -1, :]
+            scaled = logits.astype(mx.float32) / temperature
+            probs = mx.softmax(scaled)
+            key, sub = mx.random.split(key)
+            tok = int(mx.random.categorical(scaled[None], key=sub).item())
+            xs.append(tok)
+            q_rows.append(probs)
+        mx.eval(self.decode_step(self.embed([xs[-1]])))
+        self._spec_x = xs
+        self._spec_q = mx.stack(q_rows, axis=0)
+        return xs
+
+    def spec_accept(self, p_probs: mx.array, temperature: float, seed: int) -> tuple[int, int]:
+        assert self._spec_x is not None and self._spec_q is not None
+        x, q = self._spec_x, self._spec_q
+        k = len(x)
+        key = mx.random.key(2 * seed + 1)
+        a = 0
+        final: int | None = None
+        for j in range(k):
+            px = float(p_probs[j, x[j]].item())
+            qx = float(q[j, x[j]].item())
+            key, sub = mx.random.split(key)
+            r = float(mx.random.uniform(key=sub).item())
+            ratio = 1.0 if qx <= 0.0 else min(1.0, px / qx)
+            if r < ratio:
+                a += 1
+                continue
+            resid = mx.maximum(p_probs[j] - q[j], 0.0)
+            total = float(resid.sum().item())
+            key, sub = mx.random.split(key)
+            src = p_probs[j] if total <= 0.0 else (resid / total)
+            logits = mx.where(src > 0.0, mx.log(src), -1e30)
+            final = int(mx.random.categorical(logits[None], key=sub).item())
+            break
+        if final is None:
+            key, sub = mx.random.split(key)
+            logits = mx.where(p_probs[k] > 0.0, mx.log(p_probs[k]), -1e30)
+            final = int(mx.random.categorical(logits[None], key=sub).item())
+        self._spec_x = None
+        self._spec_q = None
+        return a, final
+
+    def verify_scalars(self, hidden_states: mx.array, x: list[int], temperature: float) -> list[float]:
+        p = mx.softmax(self.decode_logits(hidden_states).astype(mx.float32) / temperature, axis=-1)[0]
+        self._last_probs = p
+        return [float(p[j, x[j]].item()) for j in range(len(x))]
+
+    def logits_at(self, pos: int) -> mx.array:
+        assert self._last_probs is not None
+        return self._last_probs[pos][None]  # [1, vocab]
+
+    def accept_scalars(self, px: list[float], seed: int) -> tuple[int, int]:
+        assert self._spec_x is not None and self._spec_q is not None
+        x, q = self._spec_x, self._spec_q
+        k = len(x)
+        key = mx.random.key(2 * seed + 1)
+        a = 0
+        for j in range(k):
+            qx = float(q[j, x[j]].item())
+            key, sub = mx.random.split(key)
+            r = float(mx.random.uniform(key=sub).item())
+            ratio = 1.0 if qx <= 0.0 else min(1.0, px[j] / qx)
+            if r < ratio:
+                a += 1
+                continue
+            self._spec_key = key
+            return a, j
+        self._spec_key = key
+        return a, k
+
+    def resample_at(self, p_row: mx.array, pos: int) -> int:
+        assert self._spec_key is not None and self._spec_x is not None and self._spec_q is not None
+        key = self._spec_key
+        q = self._spec_q
+        k = len(self._spec_x)
+        key, sub = mx.random.split(key)
+        if pos < k:
+            resid = mx.maximum(p_row[0] - q[pos], 0.0)
+            total = float(resid.sum().item())
+            src = p_row[0] if total <= 0.0 else (resid / total)
+        else:
+            src = p_row[0]
+        logits = mx.where(src > 0.0, mx.log(src), -1e30)
+        final = int(mx.random.categorical(logits[None], key=sub).item())
+        self._spec_x = None
+        self._spec_q = None
+        self._spec_key = None
+        return final
+
+    def verify_probs(self, hidden_states: mx.array, temperature: float) -> mx.array:
+        logits = self.decode_logits(hidden_states)
+        return mx.softmax(logits.astype(mx.float32) / temperature, axis=-1)[0]
+
+    def verify_accept(self, hidden_states: mx.array, x: list[int], temperature: float, seed: int) -> tuple[int, int]:
+        p = mx.softmax(self.decode_logits(hidden_states).astype(mx.float32) / temperature, axis=-1)[0]
+        k = len(x)
+        vocab = p.shape[-1]
+        key = mx.random.key(seed)
+        a = 0
+        final: int | None = None
+        for j in range(k):
+            key, sub = mx.random.split(key)
+            r = float(mx.random.uniform(key=sub).item())
+            if r < float(p[j, x[j]].item()):
+                a += 1
+                continue
+            resid = mx.where(mx.arange(vocab) == x[j], 0.0, p[j])
+            resid = resid / resid.sum()
+            key, sub = mx.random.split(key)
+            logits = mx.where(resid > 0.0, mx.log(resid), -1e30)
+            final = int(mx.random.categorical(logits[None], key=sub).item())
+            break
+        if final is None:
+            key, sub = mx.random.split(key)
+            logits = mx.where(p[k] > 0.0, mx.log(p[k]), -1e30)
+            final = int(mx.random.categorical(logits[None], key=sub).item())
+        return a, final
+
     def decode_logits(self, hidden_states: mx.array) -> mx.array:
         x = self.model.model.norm(hidden_states)
         if self.model.args.tie_word_embeddings:
             return self.model.model.embed_tokens.as_linear(x)
         return self.model.lm_head(x)
     
-    def sample_token(self, logits: mx.array, temperature: float = 0.0) -> int:
+    def sample_token(self, logits: mx.array, temperature: float = 0.0, seed: int | None = None) -> int:
         last_logits = logits[0, -1, :]
         if temperature == 0.0:
             return mx.argmax(last_logits).item()
-        else:
-            probs = mx.softmax(last_logits / temperature)
-            return mx.random.categorical(mx.log(probs)).item()
+        scaled = last_logits / temperature
+        if seed is None:
+            return mx.random.categorical(scaled).item()
+        return mx.random.categorical(scaled[None], key=mx.random.key(seed)).item()
