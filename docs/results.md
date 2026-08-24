@@ -574,6 +574,88 @@ New primitives: TCP `Trim`/`Verify`/`VerifyResult`/`LogitsAt` frames + `Frame.au
 
 ## Next
 
-Two-Mac benchmark over Thunderbolt + WiFi: tok/s, α, round-trips/token, return-bytes/token vs the
-two-node pipeline baseline — the "worker idle time drops from ~65% to ~20%" number. Then the K-sweep
-per transport (optimal K rises as bandwidth falls), and fp16-on-the-wire for the sampled distribution.
+The two-Mac benchmark below.
+
+---
+
+# Step 3 — Milestone B: distributed speculative decoding, TWO physical machines (the headline)
+
+Draft: Llama-3.2-1B-Instruct-4bit (coordinator-local) · Target: Llama-3.2-3B-Instruct-4bit,
+split coordinator 0..14 / worker 14..28
+Coordinator: 2023 MacBook Air, M2, 8 GB RAM (draft :8766 + target shard 0..14 :8765 + Rust coordinator)
+Worker: 16 GB Mac (target shard 14..28 :8765 + Rust `--mode worker --listen 9000`)
+Transports: Thunderbolt bridge (worker `10.0.0.2`) and WiFi (worker `192.168.4.77`), both to `:9000`
+Date: August 23, 2026
+
+The first real two-machine timing of distributed spec decoding — every earlier spec number was
+single-node (net loss, expected) or loopback-only (all shards contend for one GPU). Greedy (temp 0),
+draft greedy (temp 0), so the worker returns per-position argmax ids: the **greedy lazy return, 20 B/round**
+vs the 256 KB/token the non-spec pipeline ships. K=4, 200 generated tokens/run, one warm-up discarded.
+Driver: `scripts/run_sweep_specB.sh`. Baseline (spec-off) = `run_coordinator` on the same servers,
+same session, run-for-run against the spec-on arm.
+
+## Correctness — byte-identical gate ✅ (on hardware)
+
+Greedy spec output is **byte-identical to the spec-off two-node pipeline** for all 4 prompts, **and
+identical across Thunderbolt vs WiFi** (8/8 diffs clean). The network split and the three-way cache
+rollback (draft + local shard + worker-over-TCP) are lossless on real machines, not just loopback.
+
+## Throughput — spec-off vs spec-K4, per transport (tok/s, steady-state)
+
+| Prompt tok | TB off | **TB spec** | TB × | WiFi off | **WiFi spec** | WiFi × | α | acc/verify |
+|-----------:|-------:|------------:|-----:|---------:|--------------:|-------:|----:|-----------:|
+|         12 |   21.3 |    **24.1** | 1.13 |     12.0 |      **18.2** |  1.52 | 0.544 | 3.16 |
+|         59 |   20.7 |    **24.3** | 1.17 |     11.2 |      **18.3** |  1.63 | 0.544 | 3.16 |
+|        110 |   18.9 |    **25.9** | 1.37 |     11.3 |      **19.8** |  1.75 | 0.616 | 3.43 |
+|        256 |   19.2 |    **25.8** | 1.34 |      8.8 |      **19.1** |  2.17 | 0.608 | 3.43 |
+
+round-trips/emitted-token ≈ **0.29–0.32** (one worker exchange per ~3.2–3.4 emitted tokens) vs exactly
+**1.0** for the non-spec pipeline; verify return **20 B/round** vs 256 KB/token.
+
+## The result
+
+- **WiFi is where it lands: up to 2.17× (P250), 1.5–1.8× across the board.** Spec decoding erases the
+  256 KB/token logits return that our own step-2 data proved was the WiFi bottleneck — the greedy lazy
+  return is 20 B/round, and there's only ~0.3 round-trips per token. **On Thunderbolt the win is smaller
+  (1.13–1.37×)** because the return was already nearly free there (network ~0.8 ms); spec still helps by
+  batching the worker forward, but there's no round-trip cost to amortize.
+- **Spec collapses the transport gap.** Baseline WiFi runs at 0.46–0.56× of Thunderbolt (the network
+  tax). Spec-on WiFi (18–20 tok/s) reaches **0.74–0.79× of spec-on TB** (24–26) — the two transports
+  nearly converge, because the link is hit ⅓ as often and returns almost nothing.
+- **Speedup grows with prompt length**, most sharply on WiFi (1.52× → 2.17×): the non-spec baseline
+  degrades as context grows (WiFi P250 collapses to 8.8 tok/s under the 8 GB coordinator's prefill
+  memory pressure), while spec stays flat at ~19 — spec is *more* robust to the pressure that hurts the
+  plain pipeline.
+
+## Mechanism — per-stage medians (P250; spec µs are per *round* ≈ 3.43 emitted tokens)
+
+| case | local | network | worker | round-trip |
+|---|------:|--------:|-------:|-----------:|
+| WiFi off  (per token) |  23.9 ms | **44.3 ms** | 22.6 ms | 68.3 ms |
+| WiFi spec (per round) |  87.5 ms | **12.8 ms** | 45.4 ms | 57.4 ms |
+| TB off    (per token) |  23.0 ms |   0.87 ms | 22.7 ms | 23.6 ms |
+| TB spec   (per round) |  86.0 ms |   0.75 ms | 39.8 ms | 40.6 ms |
+
+Per **emitted token** (÷3.43), WiFi spec's network stage is ~3.7 ms vs the baseline's 44.3 ms — a ~12×
+cut, from (a) the 20 B return replacing 256 KB and (b) one round-trip per ~3.4 tokens. `local` rises to
+~88 ms/round because it now runs the 1B draft (~50 ms) + a K+1-wide local-shard forward, but amortized
+over 3.43 tokens (~26 ms/tok) it's on par with the baseline's 24 ms/tok — **the draft compute that made
+spec a net loss single-node is hidden behind the network round-trip it removes.** This is exactly the
+distributed-regime argument from the Milestone-A notes, now measured.
+
+## Notes / honesty
+
+- tok/s is `gen_tokens / (t - t_first)` — prefill/ttft excluded, so these are steady-state. Raw
+  per-token CSVs in `bench_out/specB/{tb,wifi}_{10,50,100,250}_{off,specK4}.csv`.
+- α rises with the longer, more structured prompts (0.544 → 0.616), pulling acc/verify 3.16 → 3.43 and
+  round-trips/tok 0.317 → 0.291 — consistent with the capped-geometric 1/E[A] law (step-4 E3).
+- This is the **synchronous** pipeline: draft and verify still alternate. The win here is fewer, cheaper
+  round-trips; the *bubble* itself (local and worker still run serially within a round) is only fully
+  killed by async overlap (Milestone C).
+
+## Next
+
+Per-transport **K-sweep** (K ∈ {1,2,4,6,8}) — "optimal K rises as bandwidth falls" (step-4 E2/E8), the
+cleanest papers-punted-we-measured result. Then temp>0 over the wire (two-phase lazy return, fp16
+distribution) and the naive-vs-lazy return A/B (E9). After that the numbers are strong enough to anchor
+the README + write-up.
