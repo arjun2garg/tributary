@@ -8,7 +8,7 @@ use mlx_client::{MlxClient, Tensor};
 use protocol::{Frame, MsgType, read_frame, write_frame, F_LAZY_SAMPLE, F_SPEC_NAIVE, F_SAMPLED, F_GREEDY_DRAFT};
 use tokio::net::{TcpListener, TcpStream};
 
-#[derive(clap::ValueEnum, Clone, PartialEq)]
+#[derive(clap::ValueEnum, Clone)]
 enum Mode {
     Single,
     Coordinator,
@@ -71,11 +71,9 @@ struct Args {
 #[derive(Clone, Copy, Default)]
 struct StepTiming {
     local_us: u128,
-    serialize_us: u128,
     roundtrip_us: u128,
     worker_us: u128,
-    network_us: u128, 
-    deserialize_us: u128,
+    network_us: u128,
     sample_us: u128,
     activation_bytes: usize,
     logits_bytes: usize,
@@ -104,10 +102,8 @@ fn print_timing_summary(prefill: &StepTiming, steps: &[StepTiming]) {
     eprintln!("{:<12} {:>8} {:>8} {:>8} {:>8}", "stage", "mean", "p50", "p90", "max");
     let col = |f: fn(&StepTiming) -> u128| steps.iter().map(f).collect::<Vec<_>>();
     summarize("local",       &col(|s| s.local_us));
-    summarize("serialize",   &col(|s| s.serialize_us));
     summarize("network",     &col(|s| s.network_us));
     summarize("worker",      &col(|s| s.worker_us));
-    summarize("deserialize", &col(|s| s.deserialize_us));
     summarize("sample",      &col(|s| s.sample_us));
     summarize("roundtrip",   &col(|s| s.roundtrip_us));
     eprintln!(
@@ -119,13 +115,13 @@ fn print_timing_summary(prefill: &StepTiming, steps: &[StepTiming]) {
 
 fn write_timing_csv(path: &str, prefill: &StepTiming, steps: &[StepTiming]) -> std::io::Result<()> {
     let mut s = String::from(
-        "token,phase,local_us,serialize_us,network_us,worker_us,roundtrip_us,deserialize_us,sample_us,activation_bytes,logits_bytes\n",
+        "token,phase,local_us,network_us,worker_us,roundtrip_us,sample_us,activation_bytes,logits_bytes\n",
     );
     let mut row = |i: usize, phase: &str, t: &StepTiming| {
         s.push_str(&format!(
-            "{i},{phase},{},{},{},{},{},{},{},{},{}\n",
-            t.local_us, t.serialize_us, t.network_us, t.worker_us, t.roundtrip_us,
-            t.deserialize_us, t.sample_us, t.activation_bytes, t.logits_bytes
+            "{i},{phase},{},{},{},{},{},{},{}\n",
+            t.local_us, t.network_us, t.worker_us, t.roundtrip_us,
+            t.sample_us, t.activation_bytes, t.logits_bytes
         ));
     };
     row(0, "prefill", prefill);
@@ -212,7 +208,7 @@ async fn run_spec_loop(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             } else if sampled_draft {
                 let p = target.verify_probs(&h, temp).await?;
                 verify_ret_bytes += p.data.len() as u128;
-                let (na, ft) = draft.accept(&p, temp, seed).await?;
+                let (na, ft) = draft.accept(&p, seed).await?;
                 (na as usize, ft)
             } else {
                 let (na, ft) = target.verify_accept(&h, &x, temp, seed).await?;
@@ -390,7 +386,7 @@ async fn run_spec_coordinator(args: &Args) -> Result<(), Box<dyn std::error::Err
     let hidden = local.forward(&local.embed(&ids).await?, "prefill").await?;
     let mut cur = {
         write_frame(&mut stream, &Frame::from_tensor(MsgType::Prefill, seq, &hidden)).await?;
-        let logits = recv_logits(&mut stream, seq).await?.into_tensor();
+        let logits = expect_frame(&mut stream, MsgType::Logits, seq).await?.into_tensor();
         seq += 1;
         if sampled {
             local.sample_seeded(&logits, temp, args.spec_seed).await?
@@ -434,7 +430,7 @@ async fn run_spec_coordinator(args: &Args) -> Result<(), Box<dyn std::error::Err
                 seq += 1;
                 return_bytes += probs.data.len() as u128;
                 if sampled_draft {
-                    let (a, final_tok) = draft.accept(&probs, temp, seed).await?;
+                    let (a, final_tok) = draft.accept(&probs, seed).await?;
                     (a as usize, final_tok, vt)
                 } else {
                     let ids = argmax_rows(&probs, k as usize + 1)?;
@@ -613,7 +609,6 @@ async fn exchange(
 ) -> Result<(u32, StepTiming), Box<dyn std::error::Error>> {
     let mut t = StepTiming::default();
 
-    let t_ser = Instant::now();
     let mut frame_out = Frame::from_tensor(msg_type, seq, hidden);
     if return_mode == ReturnMode::Lazy {
         frame_out.flags = F_LAZY_SAMPLE;
@@ -622,38 +617,33 @@ async fn exchange(
             frame_out.aux = vec![temperature.to_bits(), (seed >> 32) as u32, seed as u32];
         }
     }
-    t.serialize_us = t_ser.elapsed().as_micros();
     t.activation_bytes = frame_out.payload.len();
 
     let t_rt = Instant::now();
     write_frame(stream, &frame_out).await?;
 
     let next_id = if return_mode == ReturnMode::Lazy {
-        let reply = read_frame(stream).await?;
+        let reply = expect_frame(stream, MsgType::VerifyResult, seq).await?;
         t.roundtrip_us = t_rt.elapsed().as_micros();
-        if reply.msg_type != MsgType::VerifyResult {
-            return Err(format!("expected VerifyResult (lazy return), got {:?}", reply.msg_type).into());
-        }
-        if reply.seq != seq {
-            return Err(format!("seq mismatch: sent {seq}, got {}", reply.seq).into());
-        }
         t.worker_us = reply.worker_compute_us as u128;
         t.network_us = t.roundtrip_us.saturating_sub(t.worker_us);
         t.logits_bytes = reply.aux.len() * 4;
         *reply.aux.first().ok_or("lazy return: empty aux")?
     } else {
-        let reply = recv_logits(stream, seq).await?;
+        let reply = expect_frame(stream, MsgType::Logits, seq).await?;
         t.roundtrip_us = t_rt.elapsed().as_micros();
         t.worker_us = reply.worker_compute_us as u128;
         t.network_us = t.roundtrip_us.saturating_sub(t.worker_us);
         t.logits_bytes = reply.payload.len();
 
-        let t_de = Instant::now();
         let logits = reply.into_tensor();
-        t.deserialize_us = t_de.elapsed().as_micros();
 
         let t_s = Instant::now();
-        let id = local.sample(&logits, temperature).await?;
+        let id = if temperature > 0.0 {
+            local.sample_seeded(&logits, temperature, seed).await?
+        } else {
+            local.sample(&logits, temperature).await?
+        };
         t.sample_us = t_s.elapsed().as_micros();
         id
     };
@@ -661,13 +651,13 @@ async fn exchange(
     Ok((next_id, t))
 }
 
-async fn recv_logits(stream: &mut TcpStream, expected_seq: u32) -> Result<Frame, Box<dyn std::error::Error>> {
+async fn expect_frame(stream: &mut TcpStream, expected: MsgType, seq: u32) -> Result<Frame, Box<dyn std::error::Error>> {
     let frame = read_frame(stream).await?;
-    if frame.msg_type != MsgType::Logits {
-        return Err(format!("expected Logits frame, got {:?}", frame.msg_type).into());
+    if frame.msg_type != expected {
+        return Err(format!("expected {expected:?} frame, got {:?}", frame.msg_type).into());
     }
-    if frame.seq != expected_seq {
-        return Err(format!("seq mismatch: sent {expected_seq}, got {}", frame.seq).into());
+    if frame.seq != seq {
+        return Err(format!("seq mismatch: sent {seq}, got {}", frame.seq).into());
     }
     Ok(frame)
 }
@@ -681,23 +671,15 @@ async fn verify_exchange(
 ) -> Result<(Vec<u32>, StepTiming), Box<dyn std::error::Error>> {
     let mut t = StepTiming::default();
 
-    let t_ser = Instant::now();
     let mut frame_out = Frame::from_tensor(MsgType::Verify, seq, hidden);
     frame_out.aux = aux_out;
     frame_out.flags = flags;
-    t.serialize_us = t_ser.elapsed().as_micros();
     t.activation_bytes = frame_out.payload.len();
 
     let t_rt = Instant::now();
     write_frame(stream, &frame_out).await?;
-    let reply = read_frame(stream).await?;
+    let reply = expect_frame(stream, MsgType::VerifyResult, seq).await?;
     t.roundtrip_us = t_rt.elapsed().as_micros();
-    if reply.msg_type != MsgType::VerifyResult {
-        return Err(format!("expected VerifyResult frame, got {:?}", reply.msg_type).into());
-    }
-    if reply.seq != seq {
-        return Err(format!("seq mismatch: sent {seq}, got {}", reply.seq).into());
-    }
     t.worker_us = reply.worker_compute_us as u128;
     t.network_us = t.roundtrip_us.saturating_sub(t.worker_us);
     t.logits_bytes = reply.aux.len() * 4;
@@ -713,23 +695,15 @@ async fn verify_exchange_full(
 ) -> Result<(Tensor, StepTiming), Box<dyn std::error::Error>> {
     let mut t = StepTiming::default();
 
-    let t_ser = Instant::now();
     let mut frame_out = Frame::from_tensor(MsgType::Verify, seq, hidden);
     frame_out.flags = F_SPEC_NAIVE;
     frame_out.aux = vec![temp.to_bits()];
-    t.serialize_us = t_ser.elapsed().as_micros();
     t.activation_bytes = frame_out.payload.len();
 
     let t_rt = Instant::now();
     write_frame(stream, &frame_out).await?;
-    let reply = read_frame(stream).await?;
+    let reply = expect_frame(stream, MsgType::Logits, seq).await?;
     t.roundtrip_us = t_rt.elapsed().as_micros();
-    if reply.msg_type != MsgType::Logits {
-        return Err(format!("expected Logits frame (naive verify), got {:?}", reply.msg_type).into());
-    }
-    if reply.seq != seq {
-        return Err(format!("seq mismatch: sent {seq}, got {}", reply.seq).into());
-    }
     t.worker_us = reply.worker_compute_us as u128;
     t.network_us = t.roundtrip_us.saturating_sub(t.worker_us);
     t.logits_bytes = reply.payload.len();
@@ -770,13 +744,7 @@ async fn logits_at_exchange(
     seq: u32,
 ) -> Result<(Tensor, u128, usize), Box<dyn std::error::Error>> {
     write_frame(stream, &Frame::control_aux(MsgType::LogitsAt, seq, vec![pos])).await?;
-    let reply = read_frame(stream).await?;
-    if reply.msg_type != MsgType::Logits {
-        return Err(format!("expected Logits frame, got {:?}", reply.msg_type).into());
-    }
-    if reply.seq != seq {
-        return Err(format!("seq mismatch: sent {seq}, got {}", reply.seq).into());
-    }
+    let reply = expect_frame(stream, MsgType::Logits, seq).await?;
     let worker_us = reply.worker_compute_us as u128;
     let bytes = reply.payload.len();
     Ok((reply.into_tensor(), worker_us, bytes))

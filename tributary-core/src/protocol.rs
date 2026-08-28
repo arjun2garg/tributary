@@ -49,23 +49,22 @@ pub struct Frame {
     pub worker_compute_us: u64,
     pub shape: Vec<u32>,
     pub aux: Vec<u32>,
-    pub dtype: u8,
     pub flags: u8,
     pub payload: Bytes,
 }
 
 impl Frame {
     pub fn control(msg_type: MsgType, seq: u32) -> Self {
-        Frame { msg_type, seq, worker_compute_us: 0, shape: Vec::new(), aux: Vec::new(), dtype: 0, flags: 0, payload: Bytes::new() }
+        Self::control_aux(msg_type, seq, Vec::new())
     }
 
     pub fn control_aux(msg_type: MsgType, seq: u32, aux: Vec<u32>) -> Self {
-        Frame { msg_type, seq, worker_compute_us: 0, shape: Vec::new(), aux, dtype: 0, flags: 0, payload: Bytes::new() }
+        Frame { msg_type, seq, worker_compute_us: 0, shape: Vec::new(), aux, flags: 0, payload: Bytes::new() }
     }
 
     pub fn from_tensor(msg_type: MsgType, seq: u32, t: &Tensor) -> Self {
         let shape = t.shape.split(',').map(|s| s.parse().unwrap()).collect();
-        Frame { msg_type, seq, worker_compute_us: 0, shape, aux: Vec::new(), dtype: 0, flags: 0, payload: t.data.clone() }
+        Frame { msg_type, seq, worker_compute_us: 0, shape, aux: Vec::new(), flags: 0, payload: t.data.clone() }
     }
 
     pub fn into_tensor(self) -> Tensor {
@@ -90,7 +89,6 @@ where
     for &a in &f.aux {
         header.extend_from_slice(&a.to_be_bytes());
     }
-    header.push(f.dtype);
     header.push(f.flags);
     header.extend_from_slice(&(f.payload.len() as u64).to_be_bytes());
 
@@ -136,9 +134,6 @@ where
     }
 
     r.read_exact(&mut one).await?;
-    let dtype = one[0];
-
-    r.read_exact(&mut one).await?;
     let flags = one[0];
 
     let mut len_buf = [0u8; 8];
@@ -153,6 +148,6 @@ where
     let mut payload = vec![0u8; payload_len];
     r.read_exact(&mut payload).await?;
 
-    Ok(Frame { msg_type, seq, worker_compute_us, shape, aux, dtype, flags, payload: Bytes::from(payload) })
+    Ok(Frame { msg_type, seq, worker_compute_us, shape, aux, flags, payload: Bytes::from(payload) })
 }
 

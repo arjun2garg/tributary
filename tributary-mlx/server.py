@@ -108,9 +108,9 @@ async def verify_probs(request: Request, temperature: float):
     return tensor_response(model.verify_probs(x, temperature), dtype="float32")
 
 @app.post("/accept")
-async def accept(request: Request, temperature: float, seed: int):
+async def accept(request: Request, seed: int):
     p = tensor_from_request(await request.body(), request.headers.get("x-shape"), request.headers.get("x-dtype"))
-    a, final_token = model.spec_accept(p, temperature, seed)
+    a, final_token = model.spec_accept(p, seed)
     return {"accepted": a, "final_token": final_token}
 
 @app.post("/verify_scalars")

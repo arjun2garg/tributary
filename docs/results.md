@@ -655,7 +655,255 @@ distributed-regime argument from the Milestone-A notes, now measured.
 
 ## Next
 
-Per-transport **K-sweep** (K ∈ {1,2,4,6,8}) — "optimal K rises as bandwidth falls" (step-4 E2/E8), the
-cleanest papers-punted-we-measured result. Then temp>0 over the wire (two-phase lazy return, fp16
-distribution) and the naive-vs-lazy return A/B (E9). After that the numbers are strong enough to anchor
-the README + write-up.
+The decomposition sweep below (naive vs lazy return made an independent axis) + the K-sweep.
+
+---
+
+# Step 4 — Decomposition: speculation vs. the lazy return are separate axes (two Macs)
+
+Model / hardware as above (3B target split 0..14 / 14..28; 1B draft on coordinator; 8 GB Air +
+16 GB worker). Date: August 23, 2026.
+
+The earlier headline changed **two** things at once (speculation *and* the lazy logits return), so it
+couldn't say how much each contributed. The binary now exposes `--return-mode naive|lazy` as an axis
+**independent** of `--spec-k`, so all four cells of the 2×2 are reachable. Driver:
+`scripts/run_matrix.py` (144-run cross-product → one `bench_out/matrix/results.csv`; per-run CSV/out/err
+alongside). **Correctness:** the greedy 2×2 (A/B/C/D) is byte-identical across all four cells and to the
+single-node greedy transcript (verified on loopback before the sweep); sampled cells reproduce per seed.
+
+- **A** = spec-off, naive return (the original baseline: ship the full 256 KB distribution, sample on coord)
+- **B** = spec-off, lazy return (worker samples, returns the token id — a few bytes)
+- **C** = spec-on, naive return (worker ships **K+1** full distributions/round; coordinator accepts)
+- **D** = spec-on, lazy return (the headline: 20 B/round greedy)
+
+## The 2×2 — greedy, K=4, avg tok/s across the 4 prompt lengths
+
+| | naive return | lazy return |
+|---|---:|---:|
+| **Thunderbolt**, spec off | 18.8 (A) | 20.5 (B) |
+| **Thunderbolt**, spec on  | 22.0 (C) | 23.2 (D) |
+| **WiFi**, spec off        | 8.4 (A)  | 14.0 (B) |
+| **WiFi**, spec on         | **5.4 (C)** | **18.9 (D)** |
+
+Return payload per the same runs: A = 256 KB/token · B = **4 B/token** · C = 2,565,120 B/round
+(= (K+1)·V·4 = 5 · 128 256 · 4) · D = **20 B/round**.
+
+## Decomposition (speedup vs. the A baseline)
+
+| effect | Thunderbolt | WiFi |
+|---|---:|---:|
+| **lazy return alone** (B/A) | 1.09× | **1.67×** |
+| **speculation alone** (C/A) | 1.17× | **0.64×** ⟵ a *regression* |
+| **both** (D/A) | 1.23× | **2.25×** |
+
+**The headline finding.** On the slow link the two axes are not even the same sign:
+- **Speculation *by itself* is a net loss on WiFi (0.64×).** With a naive return, K=4 spec ships K+1 full
+  distributions per round — ~725 KB/emitted-token vs the baseline's 256 KB — so it *adds* wire traffic on
+  the link where traffic is the bottleneck. The thing every distributed-spec paper hand-waves as
+  "communication overhead" is here large enough to erase the entire speedup and then some.
+- **The lazy return is what makes distributed speculation pay** (0.64× → 2.25× once combined). It is not a
+  minor bandwidth tweak; it is the load-bearing piece on commodity WiFi.
+- **On Thunderbolt the balance flips:** the return is nearly free, so lazy adds little (1.09×) and the win
+  is mostly speculation (1.17×). Fast link → speculation is the lever; slow link → the lazy return is.
+
+This is the clean, differentiated result the testbed was built for: *"if you add distributed speculation
+to a pipeline over a real network, you get 2.25× — but only with the lazy return; without it you get
+0.64×."*
+
+## Mechanism — per-stage network median (WiFi, p256, greedy K=4)
+
+| cell | network/round (ms) | note |
+|---|---:|---|
+| A off-naive | 31.7 (per token) | the 256 KB return |
+| B off-lazy  | 9.3 (per token)  | 4 B return; just the ~6 KB activation out |
+| **C on-naive** | **323.3 (per round)** | the 2.5 MB (K+1 dists) return — this is the 0.64× |
+| D on-lazy   | 11.9 (per round) | 20 B return; ~30 KB activation out for K+1 tokens |
+
+The 323 ms/round to ship 2.5 MB back over WiFi is the whole story of cell C's collapse.
+
+## Lazy K-sweep (greedy, avg over prompts) — optimal K and the bandwidth tilt
+
+| K | TB tok/s | WiFi tok/s | α | round-trips/tok |
+|--:|---:|---:|---:|---:|
+| 1 | 19.7 | 15.0 | 0.792 | 0.559 |
+| 2 | 21.4 | 17.6 | 0.700 | 0.418 |
+| 4 | **23.2** | **18.9** | 0.578 | 0.304 |
+| 6 | 21.6 | 18.2 | 0.481 | 0.261 |
+
+Both peak at **K=4** here, but the *shape* tilts as predicted (step-4 E2/E8, "optimal K rises as bandwidth
+falls"): relative to K=1, K=6 is 1.10× on TB but **1.21× on WiFi** — a more expensive round-trip rewards
+amortizing over more speculative tokens, so WiFi holds its gain further out. α falls with K and
+round-trips/tok tracks the 1/E[A] law.
+
+## Temperature > 0 — greedy-draft is a bandwidth optimization (measured on WiFi)
+
+Lifting the old `temp>0 ⇒ draft-temp>0` restriction lets the draft run greedy at temp>0 (worker-side
+`verify_accept`, no distribution on the wire). T=0.7, lazy, K=4, avg over prompts:
+
+| draft temp | α | TB tok/s | WiFi tok/s | return |
+|---|---:|---:|---:|---|
+| 0 (greedy draft) | 0.448 | 18.9 | **15.6** | ~8 B/round |
+| 0.7 (matched)    | 0.496 | 18.3 | 11.3 | one 513 KB dist/round |
+
+The matched draft accepts more (α 0.496 vs 0.448) but must ship one full distribution per round; on WiFi
+that costs more than the extra acceptance buys (**15.6 vs 11.3 tok/s**), while on Thunderbolt they tie.
+So the greedy-draft lazy return — lower α, ~zero bytes — is the better WiFi choice: the single-node
+projection from the Aug-23 notes, now confirmed on a real link.
+
+## Notes / honesty
+
+- Greedy, steady-state tok/s (prefill/ttft excluded), K=4 unless noted; 2×2 numbers averaged over the 4
+  prompt lengths. All 144 runs completed, 0 failures. Full table: `bench_out/matrix/results.csv`.
+- Naive is restricted to K=4 in the sweep (the full naive K-sweep just re-measures the same
+  return-bytes cost at more K; `NAIVE_KS` in the driver opens it up).
+- Still the **synchronous** pipeline — draft and verify alternate. These wins are from cheaper/fewer
+  round-trips, not bubble overlap (that's Milestone C).
+
+## Next
+
+fp16-on-the-wire for the temp>0 lazy distribution (halves the 513 KB matched-draft return), then the
+README + write-up anchored on the decomposition above. Async overlap (Milestone C) is the remaining
+stretch.
+
+---
+
+# Step 5 — Scaling to 14B: the float16/bfloat16 wire bug, and where spec actually stands
+
+Target: **Qwen3-14B-4bit**, split coordinator `0..8` / worker `8..40` · Draft: **Qwen3-1.7B-4bit** (coordinator-local)
+Coordinator: 2023 MacBook Air, M2, **8 GB** (draft :8766 + target shard 0..8 :8765 + Rust coordinator)
+Worker: **Apple M4, 16 GB** (`arjungarg@192.168.4.77`; target shard 8..40 :8765 + Rust `--mode worker`)
+Transport: WiFi (`192.168.4.77:9000`); Thunderbolt was down this session. Greedy, 100 generated tokens.
+Date: August 27, 2026
+
+We moved to a 14B target (with a 1.7B draft) and found distributed spec was a **net loss** — worse than
+the plain pipeline. Chasing "why is verify so expensive" led, after several wrong turns (see honesty),
+to a **one-character dtype bug on the wire** that silently disabled batched matmul on every
+over-the-wire forward. Fixing it made the whole system 1.2–1.7× faster and moved the bottleneck off
+verify entirely. **After the fix, spec ties the plain pipeline** — it no longer loses, but it doesn't
+win, because acceptance (α≈0.43 for this draft/target) is now the binding constraint, not verify cost.
+
+## The bug — float16 activations disable the bfloat16 batched matmul
+
+Qwen3 computes in **bfloat16**, but the wire protocol serializes activations as **float16**
+(`tensor_response`/`tensor_from_request`, `Frame` dtype). Feeding a float16 activation into a
+bfloat16-weight `quantized_matmul` drops it onto an **unbatched per-row path** — so a T-token verify
+costs ~T× a single forward instead of batching. It's purely the dtype; numpy-vs-MLX origin, contiguity,
+and eval-state are all irrelevant.
+
+`decode_step`, worker shard 8..40, N=256 context, in-process (ms), by **input dtype**:
+
+| T | embed input (bf16) | wire round-trip (stays f16) | round-trip → cast to bf16 |
+|--:|-------------------:|----------------------------:|--------------------------:|
+| 1 |                 64 |                          89 |                        62 |
+| 5 |                117 |                         322 |                       117 |
+| 9 |                224 |                     **642** |                       224 |
+
+The f16 column is **linear in T (~65 ms/token)** — no batching; the bf16 columns batch (T=9 ≈ 3.5× T=1).
+Through the actual uvicorn MLX server the f16 path reproduces exactly: `/forward` decode is 98 / 182 /
+324 / **643** ms at T = 1/3/5/9. **That 643 ms is the "710 ms at T=9" that framed the whole
+investigation** — it was real, and it was this bug. (The misleading number was the in-process microbench:
+`embed()` returns bf16, so it accidentally measured the fast path the real system never uses.)
+
+## The fix
+
+Cast incoming activations to the model's compute dtype at the model boundary — 3 lines in
+`PartialModel` (`self.dtype = self.model.model.norm.weight.dtype`; `hidden_states.astype(self.dtype)` at
+the top of `prefill` and `decode_step`). Dtype-agnostic: a no-op for the fp16 Llama-3B, corrects the
+bf16 Qwen. The proper long-term fix is bf16 (or raw) activations on the wire so there's no lossy
+round-trip at all; the cast is the minimal correct patch.
+
+## Throughput — before vs after the fix (WiFi, 100 tok, greedy)
+
+| case | pre-fix tok/s | post-fix tok/s | worker stage / round (pre → post) |
+|---|---:|---:|---|
+| baseline (off) | 5.7 | **7.0** | 108 → 82 ms |
+| spec K=2 (α 0.43) | 4.8 | **6.9** | 217 → **113 ms** |
+| spec K=4 (α 0.29) | 3.6 | **6.1** | 367 → **163 ms** |
+
+Verify now batches (K=4 worker 367 → 163 ms, 2.2×). The full verify-cost curve on the M4 worker (layers
+8..40 + lm_head, N=256) confirms the batched shape: T = 1/5/9/16/32/48 → 65 / 124 / 240 / 309 / **313** /
+615 ms — a ramp to T≈16, then a **plateau T=16..32** (313 ms for 16 *or* 32 tokens; per-token floor
+~10 ms), then a tile step at T=48. So a wide tree (≤32 candidates) would verify for the price of ~T=16 —
+but see the verdict: verify is no longer the constraint.
+
+## Per-stage breakdown — baseline vs spec (WiFi, mean per stage, ms)
+
+`local` = draft (K+1 sequential 1.7B forwards on the coordinator) + coordinator shard-0..8 forward.
+Spec rows are per **round**; divide by accepted/round for per emitted token.
+
+| step | baseline / token | spec K=2 / round | spec K=4 / round |
+|---|---:|---:|---:|
+| draft + coord fwd (0..8) | 31.7 | **98.3** | 151.4 |
+| network (wire RT) | 18.5 | 37.7 | 28.5 |
+| worker (8..40 + lm_head) | 79.0 | 112.3 | 163.2 |
+| **per round** | **129** | **248** | **343** |
+| accepted / round | 1.0 | 1.87 | 2.15 |
+| **per emitted token** | **129 → 7.7 tok/s** | **133 → 7.5** | **160 → 6.3** |
+
+Self-consistent (stages sum to ≈ the run's tok/s after ttft). The tie is real and **compute-dominated,
+not a network artifact**: the two big costs are the worker verify and the draft+coord forward; network
+is ~15%.
+
+## The verdict — verify is solved; acceptance and draft cost are the wall now
+
+- **Spec no longer loses — it ties** (baseline 7.7, spec K=2 7.5 tok/s). The verify-cost problem that
+  looked like the villain all thread is a non-issue post-fix.
+- **It doesn't win because α≈0.43** → only 1.87 tokens amortize each round. The 1.7B draft just isn't a
+  good enough guesser of the 14B on these prompts.
+- **The largest spec-specific tax is the draft, not verify**: `local` triples 32 → 98 ms/round, because
+  the draft runs K+1 sequential 1.7B forwards on the **8 GB M2 Air coordinator** — the weakest machine in
+  the cluster. A faster coordinator or a cheaper/better-matched draft attacks this directly.
+
+## Thunderbolt — predicted, and why the "spec saves round-trips" intuition doesn't fire here
+
+Swapping the wire time for ~1 ms (TB) from the same breakdown:
+
+| | WiFi | Thunderbolt (predicted) |
+|---|---:|---:|
+| baseline | 7.74 | 8.95 |
+| spec K=2 | 7.53 | 8.84 |
+
+Spec does **not** get worse on TB — it stays tied. Reason: spec's round-trips are **fewer but fatter**.
+It ships the whole `[1, K+1, D]` activation per round (3× the bytes) at 0.53 round-trips/token, so its
+network cost *per token* (37.7 / 1.87 = 20 ms) ≈ baseline's (18.5 ms) — the fewer-round-trips advantage
+is cancelled by the bigger payload. Removing network helps both about equally. The "spec saves
+round-trips" win from Milestone B (the 3B, where the *return* was 256 KB and dominated) only reappears on
+a **high-latency** link (slow WiFi / WAN) where round-trip latency dominates payload size. On this
+~18 ms WiFi it's a small, latency-light regime, so the transport barely moves the verdict. (Not yet
+verified on hardware — TB was down; arithmetic only.)
+
+## Correctness — the fix broke strict greedy byte-identity (expected, not a logic bug)
+
+Post-fix, greedy `spec-off` and `spec-on` **diverge** (~token 30: "for each new token" vs "for
+subsequent token") — a long shared prefix, then an argmax flip on a near-tie. Cause: **batched verify
+(gemm) vs single-token decode (gemv) produce bit-different logits** in bf16. Pre-fix they matched *only*
+because the dtype bug forced both onto the identical unbatched per-row path. The output text also changed
+(post-fix runs in native bf16, which matches true single-node greedy; the pre-fix fp16 path was the
+degraded one). Both outputs are valid greedy decodes, but the **Milestone-B byte-identity invariant no
+longer holds** — a decision to make: accept it as standard spec numerics, or chase bit-exactness (rarely
+worth it).
+
+## Notes / honesty
+
+- **The microbench lied for most of this investigation.** In-process `decode_step` from `embed()` runs
+  bf16 (fast path); the real system serializes to fp16 on the wire (slow path). Reasoning from the
+  microbench produced a string of wrong root-causes — a "compute roofline" (killed by the 3–6%-of-peak
+  arithmetic), "memory contention" (refuted by a 30%↔53%-free test that moved nothing), and a
+  "gemv/gemm tile staircase" (contradicted by the worker's own K-sweep). The decisive move was a
+  controlled **synthetic-vs-real** comparison on one machine, then isolating the single differing
+  variable (input dtype).
+- Worker is an **M4** (faster than the M2 Air coordinator and batches better — T8/T1 ≈ 3× vs the Air's
+  ~6×); earlier "710 ms = worker compute" attributions conflated the fp16 server path with raw compute.
+- tok/s excludes ttft (steady-state). CSVs: `/tmp/fix_{off,specK2,specK4}.csv` this session (re-run into
+  `bench_out/` before committing). α here (0.43) is below the 3B/1B pair's 0.54–0.62 — smaller draft
+  relative to a harder target.
+- This is still the synchronous pipeline (draft and verify alternate); async overlap (Milestone C) is
+  orthogonal to everything above.
+
+## Next
+
+- **Push α / cut draft cost** — the only lever that flips spec from tie to win. Sweep the cached drafts
+  (Qwen3-0.6B, and the z-lab DFlash 4B/8B) and K; measure α and draft ms per round.
+- **bf16 (or raw) on the wire** — remove the lossy fp16 round-trip entirely (protocol.rs + server dtype),
+  which also restores an exact-activation path.
+- Re-verify the Thunderbolt prediction on hardware once the bridge is back up.

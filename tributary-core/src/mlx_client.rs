@@ -3,6 +3,10 @@ use serde::Deserialize;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
+fn x_csv(x: &[u32]) -> String {
+    x.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",")
+}
+
 pub struct Tensor {
     pub data: Bytes,
     pub shape: String,
@@ -212,12 +216,11 @@ impl MlxClient {
     }
 
     pub async fn verify_accept(&self, hidden: &Tensor, x: &[u32], temperature: f32, seed: u64) -> Result<(u32, u32)> {
-        let x_csv = x.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",");
         let resp: AcceptResponse = self.http
             .post(format!("{}/verify_accept", self.base))
             .query(&[("seed", seed)])
             .query(&[("temperature", temperature)])
-            .query(&[("x", x_csv.as_str())])
+            .query(&[("x", x_csv(x).as_str())])
             .header("X-Shape", &hidden.shape)
             .header("X-Dtype", "float16")
             .body(hidden.data.clone())
@@ -227,11 +230,10 @@ impl MlxClient {
         Ok((resp.accepted, resp.final_token))
     }
 
-    pub async fn accept(&self, p: &Tensor, temperature: f32, seed: u64) -> Result<(u32, u32)> {
+    pub async fn accept(&self, p: &Tensor, seed: u64) -> Result<(u32, u32)> {
         let resp: AcceptResponse = self.http
             .post(format!("{}/accept", self.base))
             .query(&[("seed", seed)])
-            .query(&[("temperature", temperature)])
             .header("X-Shape", &p.shape)
             .header("X-Dtype", "float32")
             .body(p.data.clone())
@@ -242,10 +244,9 @@ impl MlxClient {
     }
 
     pub async fn verify_scalars(&self, hidden: &Tensor, x: &[u32], temperature: f32) -> Result<Vec<f32>> {
-        let x_csv = x.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",");
         let resp: ScalarsResponse = self.http
             .post(format!("{}/verify_scalars", self.base))
-            .query(&[("temperature", temperature.to_string().as_str()), ("x", x_csv.as_str())])
+            .query(&[("temperature", temperature.to_string().as_str()), ("x", x_csv(x).as_str())])
             .header("X-Shape", &hidden.shape)
             .header("X-Dtype", "float16")
             .body(hidden.data.clone())

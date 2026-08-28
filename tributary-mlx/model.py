@@ -8,6 +8,12 @@ class PartialModel:
     def __init__(self, model_path: str, start_layer: int = 0, end_layer: int | None = None):
         self.model, self.tokenizer = load(model_path, lazy=True)
         self.num_layers = len(self.model.model.layers)
+        # Activations cross the wire as float16, but the model computes in its own
+        # dtype (bfloat16 for Qwen3). Feeding a float16 activation to a bfloat16
+        # quantized_matmul drops it onto an unbatched per-row path — verify(T) then
+        # costs ~T× a single forward instead of batching. Cast incoming activations
+        # back to the compute dtype at the model boundary to keep the batched gemm.
+        self.dtype = self.model.model.norm.weight.dtype
         self.start_layer = start_layer
         self.end_layer = end_layer if end_layer is not None else self.num_layers
         self.cache = None
@@ -39,7 +45,7 @@ class PartialModel:
 
     def prefill(self, hidden_states: mx.array) -> mx.array:
         self.cache = make_prompt_cache(self.model)[self.start_layer:self.end_layer]
-        x = hidden_states
+        x = hidden_states.astype(self.dtype)
         mask = nn.MultiHeadAttention.create_additive_causal_mask(x.shape[1]).astype(x.dtype)
         for i in range(self.start_layer, self.end_layer):
             x = self.model.model.layers[i](x, mask=mask, cache=self.cache[i - self.start_layer])
@@ -48,7 +54,7 @@ class PartialModel:
     
     def decode_step(self, hidden_states: mx.array) -> mx.array:
         assert self.cache is not None
-        x = hidden_states
+        x = hidden_states.astype(self.dtype)
         mask = create_attention_mask(x, self.cache[0])
         for i in range(self.start_layer, self.end_layer):
             x = self.model.model.layers[i](x, mask=mask, cache=self.cache[i - self.start_layer])
@@ -96,7 +102,24 @@ class PartialModel:
         self._spec_q = mx.stack(q_rows, axis=0)
         return xs
 
-    def spec_accept(self, p_probs: mx.array, temperature: float, seed: int) -> tuple[int, int]:
+    def _probs(self, hidden_states: mx.array, temperature: float) -> mx.array:
+        """Temperature-scaled softmax over the vocab in float32; drops the batch dim -> [T, vocab]."""
+        return mx.softmax(self.decode_logits(hidden_states).astype(mx.float32) / temperature, axis=-1)[0]
+
+    @staticmethod
+    def _sample_from_probs(probs: mx.array, key: mx.array) -> int:
+        """Sample one token id from a 1D prob row, guarding zeros before the log."""
+        logits = mx.where(probs > 0.0, mx.log(probs), -1e30)
+        return int(mx.random.categorical(logits[None], key=key).item())
+
+    @staticmethod
+    def _residual(p: mx.array, q: mx.array) -> mx.array:
+        """Normalized positive residual (p - q)+, falling back to p if it vanishes."""
+        resid = mx.maximum(p - q, 0.0)
+        total = float(resid.sum().item())
+        return p if total <= 0.0 else (resid / total)
+
+    def spec_accept(self, p_probs: mx.array, seed: int) -> tuple[int, int]:
         assert self._spec_x is not None and self._spec_q is not None
         x, q = self._spec_x, self._spec_q
         k = len(x)
@@ -112,23 +135,18 @@ class PartialModel:
             if r < ratio:
                 a += 1
                 continue
-            resid = mx.maximum(p_probs[j] - q[j], 0.0)
-            total = float(resid.sum().item())
             key, sub = mx.random.split(key)
-            src = p_probs[j] if total <= 0.0 else (resid / total)
-            logits = mx.where(src > 0.0, mx.log(src), -1e30)
-            final = int(mx.random.categorical(logits[None], key=sub).item())
+            final = self._sample_from_probs(self._residual(p_probs[j], q[j]), sub)
             break
         if final is None:
             key, sub = mx.random.split(key)
-            logits = mx.where(p_probs[k] > 0.0, mx.log(p_probs[k]), -1e30)
-            final = int(mx.random.categorical(logits[None], key=sub).item())
+            final = self._sample_from_probs(p_probs[k], sub)
         self._spec_x = None
         self._spec_q = None
         return a, final
 
     def verify_scalars(self, hidden_states: mx.array, x: list[int], temperature: float) -> list[float]:
-        p = mx.softmax(self.decode_logits(hidden_states).astype(mx.float32) / temperature, axis=-1)[0]
+        p = self._probs(hidden_states, temperature)
         self._last_probs = p
         return [float(p[j, x[j]].item()) for j in range(len(x))]
 
@@ -161,25 +179,18 @@ class PartialModel:
         q = self._spec_q
         k = len(self._spec_x)
         key, sub = mx.random.split(key)
-        if pos < k:
-            resid = mx.maximum(p_row[0] - q[pos], 0.0)
-            total = float(resid.sum().item())
-            src = p_row[0] if total <= 0.0 else (resid / total)
-        else:
-            src = p_row[0]
-        logits = mx.where(src > 0.0, mx.log(src), -1e30)
-        final = int(mx.random.categorical(logits[None], key=sub).item())
+        src = self._residual(p_row[0], q[pos]) if pos < k else p_row[0]
+        final = self._sample_from_probs(src, sub)
         self._spec_x = None
         self._spec_q = None
         self._spec_key = None
         return final
 
     def verify_probs(self, hidden_states: mx.array, temperature: float) -> mx.array:
-        logits = self.decode_logits(hidden_states)
-        return mx.softmax(logits.astype(mx.float32) / temperature, axis=-1)[0]
+        return self._probs(hidden_states, temperature)
 
     def verify_accept(self, hidden_states: mx.array, x: list[int], temperature: float, seed: int) -> tuple[int, int]:
-        p = mx.softmax(self.decode_logits(hidden_states).astype(mx.float32) / temperature, axis=-1)[0]
+        p = self._probs(hidden_states, temperature)
         k = len(x)
         vocab = p.shape[-1]
         key = mx.random.key(seed)
@@ -194,13 +205,11 @@ class PartialModel:
             resid = mx.where(mx.arange(vocab) == x[j], 0.0, p[j])
             resid = resid / resid.sum()
             key, sub = mx.random.split(key)
-            logits = mx.where(resid > 0.0, mx.log(resid), -1e30)
-            final = int(mx.random.categorical(logits[None], key=sub).item())
+            final = self._sample_from_probs(resid, sub)
             break
         if final is None:
             key, sub = mx.random.split(key)
-            logits = mx.where(p[k] > 0.0, mx.log(p[k]), -1e30)
-            final = int(mx.random.categorical(logits[None], key=sub).item())
+            final = self._sample_from_probs(p[k], sub)
         return a, final
 
     def decode_logits(self, hidden_states: mx.array) -> mx.array:
