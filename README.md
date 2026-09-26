@@ -2,7 +2,7 @@
 
 Distributed LLM inference across ordinary Apple Silicon Macs: pipeline parallelism over Thunderbolt or WiFi, plus distributed speculative decoding to make the split pay. Built as a measurement testbed, not a product: every knob is a flag, every run logs per-stage timings, and every number is in [`docs/results.md`](docs/results.md).
 
-**Writeup:** [Distributed speculative decoding on two laptops: what has to cross the wire](<X-ARTICLE-URL>)
+**Writeup:** [Tributary: distributed inference and speculative decoding](https://x.com/arjun2garg/status/2103664427413172656)
 
 ![Distributed speculative decoding on two Macs: 1.1–1.4× on Thunderbolt, 1.5–2.2× on WiFi](docs/figures/f10_headline.png)
 
