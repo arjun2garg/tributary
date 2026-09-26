@@ -1,909 +1,462 @@
-# Baseline
+# Benchmark results
 
-Model: Llama-3.2-3B-Instruct-4bit  
-Hardware: 2023 Macbook Air, M2 Chip, 8GB RAM
-Date: July 9, 2026
+Every number below was measured on the two machines in §0. Each section gives the setup, the tables, and a one-line result. Figures are regenerated from the per-run CSVs.
 
-## Single Node Performance
-- Tokens/sec: 2.4 tok/s
-
-## Notes
-- Verified that split partial pass is identical to full pass
-- KV cache not implemented
-
-# KV Cache Baseline
-
-Model: Llama-3.2-3B-Instruct-4bit  
-Hardware: 2023 Macbook Air, M2 Chip, 8GB RAM
-Date: July 10, 2026
-
-## Single Node Performance
-
-| Prompt length | Naive (tok/s) | Cached (tok/s) | Speedup |
-|--------------:|--------------:|---------------:|--------:|
-|            10 |           6.8 |           39.0 |    5.7x |
-|            50 |           3.3 |           39.1 |   11.7x |
-|           100 |           2.1 |           27.6 |   13.1x |
-|           250 |           0.6 |           28.4 |   44.9x |
-
-## Notes
-- Verified cached results are identical to naive implementation
-
-# Rust Generation Loop
-
-Model: Llama-3.2-3B-Instruct-4bit  
-Hardware: 2023 Macbook Air, M2 Chip, 8GB RAM
-Date: July 10, 2026
-
-Control inversion: Rust drives the generation loop via 5 localhost HTTP calls per token
-(`/detokenize`, `/embed`, `/forward?mode=decode`, `/logits?last_only=true`, `/sample`)
-against a single full-range MLX server. The Δ vs the Python-side loop is the per-token
-IPC (localhost HTTP) cost — measured single-node so later two-node numbers can be
-decomposed into IPC vs network overhead.
-
-## Single Node Performance
-
-100 generated tokens per run, greedy (temperature 0). Python loop = `/generate` SSE path
-(`--legacy`), re-measured in the same session on the same prompts.
-
-| Prompt tokens | Python loop (tok/s) | Rust loop (tok/s) | Δ per token |
-|--------------:|--------------------:|------------------:|------------:|
-|            11 |                38.6 |              34.6 |     ~3.0 ms |
-|            54 |                37.9 |              34.4 |     ~2.7 ms |
-|           108 |                38.1 |              34.3 |     ~2.9 ms |
-|           270 |                38.7 |              32.6 |     ~4.8 ms |
-
-## Notes
-- Greedy output is byte-identical between the two paths for all four prompts, plus an
-  EOS-terminating prompt (stops before max_tokens) — control inversion is lossless
-- IPC cost ≈ 3–5 ms/token across 5 HTTP calls (~0.6–1 ms per localhost round trip);
-  well below the threshold where fused endpoints would be needed
-- Logits response + sample request dominate the per-token wire traffic (~512 KB/token,
-  vocab 128,256 × fp16) — negligible on loopback, will matter over WiFi
-
-# Two-Process Split Pipeline
-
-Model: Llama-3.2-3B-Instruct-4bit  
-Hardware: 2023 Macbook Air, M2 Chip, 8GB RAM
-Date: July 14, 2026
-
-Model split across two local server processes — A: layers 0–14 (embeds), B: layers
-14–28 (final norm + lm_head) — chained by the Rust loop over loopback: embed + forward
-on A → forward + logits on B → sample. Each process holds its own KV cache.
-
-## Single Node Performance (two processes)
-
-| Run | Tokens | Split (tok/s) | Single-process Rust loop (tok/s) |
-|---|---:|---:|---:|
-| ~250-token prompt, 100 generated | 100 | 25.6 | ~33 |
-| Short prompt, EOS at 78 | 78 | 22.8 | 33.0 |
-
-## Notes
-- Greedy output byte-identical to the single-process Rust loop (same prompt, diffed
-  against the saved transcript) — per-process KV caches and the layer-14 activation
-  handoff are correct
-- Slowdown is ~10–15 ms/token, far more than the +1 HTTP call/token (~1 ms) predicts —
-  both MLX processes contend for the same GPU/memory bandwidth, and each loads the full
-  ~1.8 GB weights (compute is sliced, loading is not), so ~3.6 GB of an 8 GB machine
-  is weights
-- First generation after server start is much slower (ttft 8–23 s observed) — weight
-  page-in / warmup, not steady-state
-
-# Two-Node Pipeline (Two Physical Machines)
-
-Model: Llama-3.2-3B-Instruct-4bit  
-Coordinator: 2023 MacBook Air, M2, 8GB RAM (embed + layers 0–14 + sampling)  
-Worker: second Mac (layers 14–28 + final norm + lm_head), listening on `0.0.0.0:9000`  
-Date: August 17, 2026
-
-Coordinator drives the Rust generation loop; per decoded token it runs its local layer
-range, ships the hidden activation to the worker over a persistent length-prefixed TCP
-frame, and the worker returns logits. One worker instance serves both transports
-(reachable on its Thunderbolt IP and its WiFi IP). 200 generated tokens/run, greedy
-(temperature 0), one worker warm-up discarded.
-
-## Throughput
-
-| Prompt tokens | Thunderbolt (tok/s) | WiFi (tok/s) | TB ttft (s) | WiFi ttft (s) |
-|--------------:|--------------------:|-------------:|------------:|--------------:|
-|            12 |                20.9 |         11.2 |        0.13 |          0.24 |
-|            59 |                21.2 |         11.3 |        0.25 |          0.38 |
-|           110 |                21.1 |         11.3 |        0.35 |          0.52 |
-|           256 |                21.2 |         11.4 |        0.72 |          0.98 |
-
-Throughput is flat across prompt length (KV cache working as expected); the transport is
-the only lever — Thunderbolt is ~1.9× WiFi.
-
-## Per-token decode latency (median, ms)
-
-`round-trip` = activation send + worker compute + logits return (one TCP exchange);
-`local` = coordinator embed + layers 0–14; `serialize`/`deserialize` are <0.01 ms and omitted.
-
-| Transport | local | network | worker | round-trip | sample |
-|-----------|------:|--------:|-------:|-----------:|-------:|
-| Thunderbolt |  19.4 |    0.77 |   22.6 |       23.4 |    2.0 |
-| WiFi        |  21.0 |   29.8  |   22.1 |       52.5 |    2.6 |
-
-## Wire sizes (measured)
-
-| Transfer | Size |
-|---|---|
-| Decode activation (1 token, out) | 6,144 B (~6 KB) |
-| Logits (1 position, back) | 256,512 B (~256 KB) |
-| Prefill activation, 256-token prompt (out) | 1,572,864 B (~1.5 MB) |
-
-Matches the step-2 design estimates exactly (hidden 3072 × fp16; vocab 128,256 × fp16).
-
-## Notes
-- Greedy output is byte-identical across both transports for all four prompts, and the
-  pipeline is byte-identical to single-node — the network split is lossless (success
-  criterion 1)
-- **The network round-trip is the entire TB→WiFi delta.** Everything else is within
-  noise between transports; round-trip goes 23.4 ms → 52.5 ms and throughput halves.
-  That ~30 ms WiFi round-trip is dominated by the 256 KB logits coming *back*, not the
-  6 KB activation going out — the logits-asymmetry cost flagged in the step-2 plan,
-  now measured as the load-bearing term over WiFi
-- **The pipeline bubble, measured firsthand:** local (~19–21 ms) and worker (~22 ms)
-  run strictly serially, so each machine sits idle roughly half of every token. Even on
-  Thunderbolt (near-zero network) two-node throughput (~21 tok/s) is below the single-
-  process single-node loop (~33 tok/s) — the two devices don't overlap. This is the
-  "before" picture step 3/4 speculative decoding is meant to recover by keeping both
-  busy
-- Raw per-token CSVs in `bench_out/{tb,wifi}_{10,50,100,250}.csv`
-
-# Two-Node Pipeline — 24B Model (Fits on Neither Machine Alone)
-
-Model: Mistral-Small-24B-Instruct-2501-4bit (13.3 GB, 40 layers, **untied** lm_head)  
-Coordinator: 2023 MacBook Air, M2, 8GB RAM (embed + layers 0–10 + sampling)  
-Worker: borrowed Mac, 16GB RAM (layers 10–40 + final norm + lm_head), `0.0.0.0:9000`  
-Transports: Thunderbolt (`10.0.0.2`) and WiFi (`192.168.4.77`), both to `:9000`  
-Date: August 17–18, 2026
-
-First model too large for either machine to load alone (13.3 GB exceeds both RAM budgets),
-run across both via the pipeline split. Enabled by two changes to the MLX layer:
-- `mlx_lm.load(..., lazy=True)` — weights are memory-mapped and only materialize when a
-  layer is actually run, so each node's resident RAM scales with its layer slice, not the
-  full model. Measured directly: `mx.load` adds 0 GB until a tensor is `eval`'d; a node
-  running only its slice materializes only that slice. The old `lazy=False` default called
-  `mx.eval(model.parameters())` at load, materializing all 40 layers (~13 GB) and OOMing
-  the 8 GB node outright.
-- `decode_logits` now respects `tie_word_embeddings`. Untied Mistral has a separate
-  `lm_head`; the previous code hardcoded the tied `embed_tokens.as_linear` path and
-  produced garbage logits. Only a real run caught this — the 3B is tied, so every offline
-  check passed.
-
-## Finding the split: the 24B sits right at the pair's RAM edge
-
-Total weights (13.3 GB) barely fit across 8 GB + 16 GB, so the *balance* of the split
-decides whether either machine swaps. The 8 GB coordinator thrashes above ~3.5 GB; the
-16 GB worker above ~10 GB. Tuning, each measured on hardware:
-
-| Split (coord/worker) | Coord RAM | Worker RAM | Result |
-|---|---:|---:|---|
-| 12 / 28 | 4.14 GB | ~9.2 GB | **coordinator swaps** → ~0.03 tok/s (~38 s/tok) |
-| 8 / 32 | 2.92 GB | 10.45 GB | coord OK, but **worker swaps** under load (per-tok max 9.6 s) → 1.9 tok/s |
-| **10 / 30** | **3.53 GB** | ~9.8 GB (est.) | **both stable** → steady 6.2 tok/s (TB) |
-
-10/30 is the sweet spot: small enough on the 8 GB Air, below the worker's threshold on the
-16 GB Mac. `lazy=True` is what makes any of this possible (RAM ∝ layers run); the split
-just balances the two edges. Full 13.3 GB still downloads to each machine's disk — disk is
-not the constraint, RAM is.
-
-## Throughput sweep (10/30 split, 100 generated tokens, greedy)
-
-`steady` excludes a first-few-token prefill transient (see notes); it is the real
-per-token rate. `raw` includes it and is dominated by it only at the longest prompt.
-
-| Prompt tokens | TB steady | TB raw | WiFi steady | WiFi raw | ttft TB / WiFi |
-|--------------:|----------:|-------:|------------:|---------:|---------------:|
-|            12 |       6.3 |    6.3 |         5.0 |      5.0 |    0.6 / 0.9 s |
-|            59 |       6.2 |    5.7 |         4.8 |      4.6 |    1.3 / 1.7 s |
-|           110 |       6.3 |    5.7 |         4.9 |      4.3 |    3.3 / 3.2 s |
-|           256 |       6.2 |    1.2 |         4.9 |      1.2 |    5.3 / 6.3 s |
-
-Steady-state throughput is **flat across prompt length** (KV cache working) —
-**~6.2 tok/s Thunderbolt, ~4.9 tok/s WiFi**, TB ≈ 1.3× WiFi.
-
-## Per-token decode latency (median, steady state, ms)
-
-| local (coord, 10L) | worker (30L + logits) | network | round-trip | sample |
-|------:|-------:|--------:|-----------:|-------:|
-| 42 | 109 | TB 1 / WiFi 26 | TB 110 / WiFi 137 | 3 |
-
-## Wire sizes
-
-| Transfer | Size |
-|---|---|
-| Decode activation (1 token, out) | ~10 KB (hidden 5120 × fp16) |
-| Logits (1 position, back) | 262,144 B (~256 KB; vocab 131,072 × fp16) |
-| Prefill activation, 12-token prompt (out) | 122,880 B (~120 KB) |
-
-## Notes
-- **Correct:** coherent greedy output across two machines — *"A KV cache is a data
-  structure that stores key-value pairs in memory for quick access and retrieval."* A
-  model that loads on neither Mac alone now runs on both.
-- **RAM ∝ layers run, proven on hardware** (10/30: coord 3.53 GB, worker ~9.8 GB vs 13.3 GB
-  full). This is the result that makes the whole project premise hold — splitting buys
-  model size.
-- **Thunderbolt ≈ 1.3× WiFi**, and the entire delta is the network stage: 1 ms (TB) vs
-  26 ms (WiFi) per token, which is the 256 KB logits coming *back*. Everything else
-  (local 42 ms, worker 109 ms, sample 3 ms) is transport-independent. Logits dominate the
-  wire vs the ~10 KB activation out, as at 3B.
-- **The P250 "collapse" (raw 1.2 tok/s) is a startup transient, not steady state.** After
-  the large 256-token prefill, the first ~3 decode tokens stall 12–30 s each (`local` max
-  30 s) as the **8 GB coordinator** pages under the prefill's memory spike, then recover to
-  ~42 ms. Over a 100-token run those 3 tokens are ~69 of 83 s → the *average* tanks, but
-  steady state is unaffected (6.2 tok/s). The **worker** stays stable throughout (mean
-  125 ms). So each machine has a distinct memory edge: the worker's is fixed by the split;
-  the coordinator's shows only after a big prefill and amortizes over longer generations.
-- **Lazy-loading tradeoff:** saves RAM but front-loads materialization into ttft / the
-  first tokens. Steady-state is unaffected once weights are resident.
-- **The pipeline bubble persists:** local (42 ms) and worker (109 ms) run strictly
-  serially, so each machine idles part of every token. Even on Thunderbolt it's ~6 tok/s —
-  the "before" picture speculative decoding (step 3/4) is meant to recover.
-- Raw per-token CSVs in `bench_out/mistral24b/{tb,wifi}_{10,50,100,250}.csv`;
-  sweep driver `run_sweep_24b.sh`.
+Contents: [0 Hardware and method](#0-hardware-and-method) · [1 Single-node baselines](#1-single-node-baselines) · [2 Two-node pipeline](#2-two-node-pipeline-llama-32-3b) · [3 24B model](#3-mistral-small-24b-fits-on-neither-mac) · [4 Single-node speculation](#4-single-node-speculative-decoding) · [5 What the verifier returns](#5-what-the-verifier-returns) · [6 Two-machine speculation](#6-two-machine-speculative-decoding-llama-32-3b) · [7 Decomposition](#7-decomposition-speculation--return-mode) · [8 Qwen3-14B](#8-qwen3-14b) · [9 exo head-to-head](#9-head-to-head-vs-exo) · [10 Acceptance vs literature](#10-acceptance-vs-the-literature) · [Correctness](#correctness)
 
 ---
 
-# Step 3 — Speculative Decoding, Milestone A (single node, greedy)
+## 0. Hardware and method
 
-Draft: Llama-3.2-1B-Instruct-4bit · Target: Llama-3.2-3B-Instruct-4bit (tied)
-Hardware: 2023 MacBook Air, M2, 8 GB RAM
-Date: August 20, 2026
+| Role | Machine | RAM |
+|---|---|---:|
+| Coordinator | 2023 MacBook Air, M2 | 8 GB |
+| Worker | Mac, M4 | 16 GB |
 
-Both models in one machine, two MLX server processes (target :8765, draft :8766).
-Draft proposes K tokens (one `/draft` call: primes `cur`, greedy-generates x_1..x_K,
-sync-feeds x_K); target verifies all K in **one** batched forward and returns per-position
-greedy argmax; accept/reject + symmetric KV-cache trim run in the Rust loop
-(`--spec-k`, `--draft-model`). Leviathan greedy degenerate case: accept x_i iff
-`argmax(p_i) == x_i`.
+Links: a Thunderbolt bridge (network stage 0.6–0.9 ms/token) and shared WiFi (18–50 ms/token). Software: Python 3.11, `mlx` / `mlx-lm`, Rust; exo at commit `21a54c5` on stock MLX 0.32.0. All models are 4-bit `mlx-community` quantizations.
 
-## Correctness — byte-identical gate ✅
+- **Prompts** are calibrated to 12 / 59 / 110 / 256 tokens (p12 … p256) and reused verbatim across experiments.
+- **tok/s** is steady-state decode: generated tokens over the time from the first token to the last. Prefill is excluded and reported as time-to-first-token (ttft).
+- **Greedy** (temperature 0) unless stated. Sampled runs are seeded and reproducible per seed.
+- **α** as logged is `accepted / (rounds · K)`, the accepted fraction per round. It equals Leviathan's per-token acceptance probability only at K=1; tables say which is meant.
+- **Stages**: `local` is coordinator compute (draft + local shard), `network` is time on the wire, `worker` is remote compute. Medians unless stated, per token for the plain pipeline and per round for speculation.
 
-Temp-0 spec output is **byte-identical** to the plain single-node greedy transcript across
-**3 prompts** (KV-cache explainer + count, a Python function, a prime list) × **K ∈
-{1,2,4}**. This exercises all three rollback regimes — accept-none (`trim K`), partial
-(`trim K−a`), all-accepted (`trim 0`, relies on the draft's sync-fed x_K keeping the two
-caches symmetric). The offset-aware causal mask on the K-wide verify pass
-(`create_attention_mask(x, cache[0])`, mirroring mlx-lm's own `LlamaModel.__call__`) is
-what makes each verify position reproduce sequential decode exactly. This is the milestone
-deliverable.
+---
 
-## Performance — K sweep (prompt: KV-cache explainer + count, 128 tok cap)
+## 1. Single-node baselines
 
-| K | accept α | mean accepted / verify | tok/s | rel. | draft ms/round | verify ms/round |
-|---|---|---|---|---|---|---|
-| baseline (greedy) | — | 1.00 | **35.4** | 1.00× | — | — |
+**Setup.** Llama-3.2-3B-Instruct-4bit on the M2 Air alone, greedy, 100 generated tokens. July 2026.
+
+KV cache on vs off, by prompt length:
+
+| Prompt tokens | No cache (tok/s) | Cached (tok/s) | Speedup |
+|--:|--:|--:|--:|
+| 10 | 6.8 | 39.0 | 5.7× |
+| 50 | 3.3 | 39.1 | 11.7× |
+| 100 | 2.1 | 27.6 | 13.1× |
+| 250 | 0.6 | 28.4 | 44.9× |
+
+Generation loop in Python (in-process) vs in Rust (five localhost HTTP calls per token):
+
+| Prompt tokens | Python loop (tok/s) | Rust loop (tok/s) | Δ per token |
+|--:|--:|--:|--:|
+| 11 | 38.6 | 34.6 | ~3.0 ms |
+| 54 | 37.9 | 34.4 | ~2.7 ms |
+| 108 | 38.1 | 34.3 | ~2.9 ms |
+| 270 | 38.7 | 32.6 | ~4.8 ms |
+
+Layers split across two MLX processes on the same machine (0–14 / 14–28):
+
+| Run | Tokens | Two-process split (tok/s) | Single process (tok/s) |
+|---|--:|--:|--:|
+| p250 prompt, 100 generated | 100 | 25.6 | ~33 |
+| Short prompt, EOS at 78 | 78 | 22.8 | 33.0 |
+
+**Result.** The Rust loop costs 3–5 ms/token of localhost HTTP; splitting layers across two processes on one machine costs ~25% because the two stages run serially and contend for one GPU.
+
+---
+
+## 2. Two-node pipeline, Llama-3.2-3B
+
+**Setup.** Llama-3.2-3B-Instruct-4bit, coordinator layers 0–14, worker layers 14–28 + lm_head. Greedy, 200 generated tokens, one warm-up discarded. August 17, 2026.
+
+| Prompt tokens | Thunderbolt (tok/s) | WiFi (tok/s) | ttft TB (s) | ttft WiFi (s) |
+|--:|--:|--:|--:|--:|
+| 12 | 20.9 | 11.2 | 0.13 | 0.24 |
+| 59 | 21.2 | 11.3 | 0.25 | 0.38 |
+| 110 | 21.1 | 11.3 | 0.35 | 0.52 |
+| 256 | 21.2 | 11.4 | 0.72 | 0.98 |
+
+Per-token decode latency (median, ms):
+
+| Transport | local | network | worker | round-trip | sample |
+|---|--:|--:|--:|--:|--:|
+| Thunderbolt | 19.4 | 0.77 | 22.6 | 23.4 | 2.0 |
+| WiFi | 21.0 | 29.8 | 22.1 | 52.5 | 2.6 |
+
+Wire sizes (measured):
+
+| Transfer | Bytes |
+|---|--:|
+| Decode activation, 1 token, coordinator → worker | 6,144 |
+| Logits, 1 position, worker → coordinator | 256,512 |
+| Prefill activation, 256-token prompt | 1,572,864 |
+
+**Result.** Thunderbolt is 1.9× WiFi and the entire difference is the network stage, dominated by the 256 KB logits returned per token. Even on Thunderbolt the two-node pipeline (21 tok/s) is slower than one machine (33 tok/s) because the two stages run strictly serially.
+
+---
+
+## 3. Mistral-Small-24B (fits on neither Mac)
+
+**Setup.** Mistral-Small-24B-Instruct-2501-4bit, 13.3 GB, 40 layers. Coordinator layers 0–10, worker 10–40. Greedy, 100 generated tokens. Weights load lazily so each node materializes only its layer range. August 17–18, 2026.
+
+Choosing the split:
+
+| Split (coord / worker) | Coordinator RAM | Worker RAM | Outcome |
+|---|--:|--:|---|
+| 12 / 28 | 4.14 GB | ~9.2 GB | coordinator swaps → ~0.03 tok/s |
+| 8 / 32 | 2.92 GB | 10.45 GB | worker swaps → 1.9 tok/s |
+| **10 / 30** | **3.53 GB** | **~9.8 GB** | both stable → 6.2 tok/s |
+
+Throughput at 10/30. `steady` excludes the post-prefill transient; `raw` includes it.
+
+| Prompt tokens | TB steady | TB raw | WiFi steady | WiFi raw | ttft TB / WiFi (s) |
+|--:|--:|--:|--:|--:|--:|
+| 12 | 6.3 | 6.3 | 5.0 | 5.0 | 0.6 / 0.9 |
+| 59 | 6.2 | 5.7 | 4.8 | 4.6 | 1.3 / 1.7 |
+| 110 | 6.3 | 5.7 | 4.9 | 4.3 | 3.3 / 3.2 |
+| 256 | 6.2 | 1.2 | 4.9 | 1.2 | 5.3 / 6.3 |
+
+Per-token decode latency (median, steady state, ms):
+
+| local (10 layers) | worker (30 layers + lm_head) | network | round-trip | sample |
+|--:|--:|--:|--:|--:|
+| 42 | 109 | TB 1 / WiFi 26 | TB 110 / WiFi 137 | 3 |
+
+**Result.** A model that loads on neither machine alone runs at 6.2 tok/s over Thunderbolt and 4.9 over WiFi; resident RAM scales with the layers a node runs.
+
+**Caveat.** The p256 raw collapse is three decode tokens stalling 12–30 s each while the 8 GB coordinator pages after the large prefill (about 69 of 83 s); steady state is unaffected.
+
+---
+
+## 4. Single-node speculative decoding
+
+**Setup.** Draft Llama-3.2-1B-Instruct-4bit, target Llama-3.2-3B-Instruct-4bit, both on the M2 Air. Greedy draft and target, 128-token cap, one prompt. August 20, 2026.
+
+| K | α (accepted fraction) | accepted / verify | tok/s | vs baseline | draft ms/round | verify ms/round |
+|--:|--:|--:|--:|--:|--:|--:|
+| 0 (baseline) | — | 1.00 | **35.4** | 1.00× | — | — |
 | 1 | 0.806 | 1.77 | 32.1 | 0.91× | 24.5 | 28.5 |
 | 2 | 0.739 | 2.39 | 33.4 | 0.94× | 29.4 | 39.5 |
 | 4 | 0.641 | 3.44 | 29.5 | 0.83× | 50.0 | 62.4 |
 | 6 | 0.456 | 3.67 | 21.8 | 0.62× | 71.1 | 92.4 |
 
-α and accepted-tokens/verify behave exactly as theory predicts (α falls as K grows;
-accepted/verify rises but sub-linearly). α is higher on structured/repetitive prompts
-(prime list α=0.907 at K=2) than prose.
+![Single-node K sweep](figures/f5_k_sweep.png)
 
-## Notes
+Exactness of sampled output. The empirical distribution of the first emitted token over N speculative rounds is compared to the target's exact distribution p\* by total-variation distance, against the expected TV of N direct draws from p\*.
 
-- **Single-node spec is a *net loss* here (0.6–0.94×), and the diagnosis is clean.** Verify
-  batches efficiently — the K-token target forward scales at only ~13 ms/extra token, so at
-  K=4 verify costs ~18 ms per *accepted* token; **verify-only would be ~1.5×.** But the 1B
-  **draft's compute (24–71 ms/round) more than eats that gain.** Per round at K=4:
-  draft 50 + verify 62 = 112 ms for 3.44 tokens = 32.6 ms/tok vs baseline 28.2 ms/tok.
-- **Why this is the *expected* single-node result, not a bug.** The "verify K for the price
-  of 1" premise holds when a forward is latency-bound by weight loading (big GPUs); on the
-  M2 Air a 3B-4bit forward is already fast, so K tokens add real marginal cost and the draft
-  is pure overhead. This is precisely why the interesting regime is **distributed**
-  (Milestone B): there the ~30 ms/token logits round-trip dominates, and spec amortizes it
-  over ~αK emitted tokens per round-trip — the draft compute is hidden behind network cost.
-- **It also motivates the zero-compute draft** (doc Tier 2 #4, prompt-lookup / n-gram): with
-  draft cost → 0, the K=4 verify-only path projects to ~1.5× *on a single node* and needs no
-  second model on the 8 GB Air. Strong next A/B.
-- Architecture reuses the existing pipeline: verify = `/embed`+`/forward`+`/argmax`, the same
-  chain the decode loop already walks, so it generalizes to the two-node split with no
-  rewrite. New primitives: `PartialModel.{draft_generate, greedy_all, trim}`, endpoints
-  `/draft` `/argmax` `/trim`, Rust `run_spec_loop`.
+| T | N | TV(spec, p\*) | Noise floor | Ratio |
+|--:|--:|--:|--:|--:|
+| 0.3 | 400 | 0.0052 | 0.0245 | 0.21 |
+| 0.8 | 400 | 0.0216 | 0.0421 | 0.51 |
+| 1.0 | 700 | 0.0267 | 0.0507 | 0.53 |
+
+α across five seeds at T=0.8, K=4: 0.44, 0.49, 0.54, 0.63, 0.49.
+
+**Result.** On one machine speculation is a net loss (0.83× at K=4): a 3B-4bit forward is already fast on the Air, so the K verify tokens cost real time and the 1B draft is pure overhead. Sampled output matches the target distribution to within sampling noise.
 
 ---
 
-# Step 3 — Speculative Decoding, Milestone A (temp>0, **exact**)
+## 5. What the verifier returns
 
-Same hardware / model pair, Aug 20 2026. Extends greedy spec to full Leviathan sampling.
+**Setup.** Same 1B → 3B pair on one machine, K=4, seeded. Measured bytes returned by the verifier per round: **8 B** with a greedy draft (accepted count + final token) vs **2,565,120 B** with a sampled draft and a naive return (K+1 fp32 distributions over a 128,256-token vocabulary). August 23, 2026.
 
-The draft now **samples** K tokens from `q` at temperature T (seeded) and keeps its
-distributions; the target returns per-position `p` at T (`/verify_probs`, fp32); the
-**accept/reject + residual resampling runs on the draft server** (`/accept`), which is where
-`q` lives — this is the B-aligned placement (in Milestone B the draft is the
-coordinator-local model and §1.3 has the accept test run there). Rust plumbs the tensors and
-coordinates the same symmetric `K−a` trim as greedy. Accept x_j iff `r < min(1, p_j(x_j)/q_j(x_j))`;
-at first reject resample from `norm(max(0, p_j − q_j))`; if all K accepted, free bonus from `p_K`.
-New flag `--spec-seed` (per-round seed = base + round); token #0 is a seeded target sample.
+Per emitted token, dividing by the measured tokens per round:
 
-## Exactness — proof + statistical gate ✅
+| Target T | Tokens / round | Naive, K+1 fp32 | Lazy, 1 fp32 | Lazy, 1 fp16 | Greedy draft |
+|--:|--:|--:|--:|--:|--:|
+| 0.3 | 2.97 | 843 KB | 169 KB | 84 KB | ~3 B |
+| 0.7 | 2.88 | 870 KB | 174 KB | 87 KB | ~4 B |
+| 1.0 | 2.71 | 924 KB | 185 KB | 92 KB | ~4 B |
 
-**Algebraic:** for the first emitted position, `P(emit y) = min(q(y),p(y)) + max(0, p(y)−q(y)) = p(y)` —
-the output is exactly the target distribution, independent of the draft. So the correctness gate
-is statistical (not byte-level, as with greedy).
+![Bytes returned per emitted token by scheme](figures/f4_bytes_per_token.png)
 
-**Empirical:** fix a context, compute the target's exact `p*`, run N spec rounds, compare the
-empirical distribution of the emitted token to `p*` via total-variation distance — against a
-noise floor = expected TV of N *direct* multinomial draws from `p*`. Spec is exact iff
-`TV(spec) ≈ TV(direct)`.
+One distribution, by vocabulary size:
 
-| T | N | TV(spec, p*) | noise floor | ratio | verdict |
-|---|---|---|---|---|---|
-| 0.3 | 400 | 0.0052 | 0.0245 | 0.21 | within floor ✅ |
-| 0.8 | 400 | 0.0216 | 0.0421 | 0.51 | within floor ✅ |
-| 1.0 | 700 | 0.0267 | 0.0507 | 0.53 | within floor ✅ |
-
-Every ratio ≤ 1 — spec's deviation from `p*` is no larger than pure sampling noise. (At T=1.0,
-N=200 gave a misleading ratio 1.68; raising N→700 dropped it to 0.53, confirming it was small-N
-noise on the flatter high-temp distribution, exactly as the proof predicts.)
-
-## Reproducibility + α
-
-- **Seeded → reproducible:** same `--spec-seed` twice → byte-identical transcript; different seed
-  → different text. (Greedy determinism was byte-identical to baseline; temp>0 determinism is
-  per-seed.)
-- **α across 5 seeds** (T=0.8, K=4, real story-continuation prompt): 0.44, 0.49, 0.54, 0.63, 0.49
-  — stable ~0.5, spread is just different sampled trajectories. mean accepted/verify ≈ 2.7–3.4.
-- Perf tracks the greedy finding: ~24 tok/s at T=0.8 K=4 (draft compute still dominates
-  single-node; the win is distributed / zero-compute-draft, per the greedy notes).
-
-## Notes / honesty
-
-- **A ships the full `p` [K+1, vocab] fp32** target→coordinator each round (localhost, cheap —
-  correctness milestone). Milestone B replaces this with §1.3's lazy return (K scalars `p_i(x_i)`
-  + one full distribution at the reject point) so the slow WiFi link isn't hit with K×256 KB.
-- New primitives: `PartialModel.{draft_sample, spec_accept, verify_probs}`, seeded `sample_token`;
-  endpoints `/draft_sample` `/verify_probs` `/accept`; fp32 tensor support; Rust
-  `{draft_sample, verify_probs, accept, sample_seeded}` + temp>0 branch in `run_spec_loop`.
-
-## Next
-
-§1.3 lazy-logits return, then distributed **Milestone B** (`Trim` TCP frame,
-draft-on-coordinator, verify across the pipeline). The single-node greedy + exact-sampling
-machinery here is the reusable base for both.
-
----
-
-# Step 3 — Greedy-draft speculative sampling (lazy accept-on-verifier)
-
-Same hardware / model pair, Aug 23 2026. New `--draft-temp` flag (default **0**);
-`--temperature` is the target temp as before. This is §1.3's lazy return, made trivial.
-
-**Idea.** Force the **draft to temp 0** (argmax). Then `q_j` is a point mass on the drafted
-token `m_j`, and Leviathan collapses: accept iff `r < p_j(m_j)` (a scalar), and the reject
-resample is just **`p_j` with `m_j` zeroed and renormalized** (`norm(max(0,p−q))` with a
-point-mass `q`). Marginal is still exactly `p` (`P(emit m_j)=p_j(m_j)`,
-`P(emit y≠m_j)=p_j(y)`). Because the verifier already knows the drafted ids, it runs the whole
-accept+resample itself and **returns just `(accepted, final_token)` — no `q`, no distribution
-on the wire.** For `--draft-temp > 0` the old sampled-draft path (ships full `p`) still runs.
-
-## Deliverable 1 — network return per token: greedy vs shipping a distribution
-
-**Why temp 0 is special:** the reject resample `norm(max(0,p−q))` needs `q`. For any
-`draft-temp>0`, `q` lives on the draft, so ≥1 full distribution must cross the wire (the
-verifier can't resample alone). At `draft-temp=0`, `q` is known, so the verifier resamples and
-returns one token id. Measured `verify_ret` per round: **greedy = 8 B**, sampled =
-**2,565,120 B** (= (K+1)·V·4, K=4, V=128 256, fp32) — confirmed on the wire.
-
-Per **emitted** token (÷ measured mean-accepted/verify `T_round`), for our V=128 256 pair:
-
-| target T | sampled T_round | naive (K+1 fp32) | lazy min (1 fp32) | lazy min (1 fp16) | greedy |
-|---|---|---|---|---|---|
-| 0.3 | 2.97 | 843 KB/tok | 169 KB/tok | 84 KB/tok | ~3 B/tok |
-| 0.7 | 2.88 | 870 KB/tok | 174 KB/tok | 87 KB/tok | ~4 B/tok |
-| 1.0 | 2.71 | 924 KB/tok | 185 KB/tok | 92 KB/tok | ~4 B/tok |
-
-Greedy eliminates essentially the entire return: ~**850 KB/token** vs the current impl, ~**170
-KB/token** vs the best *exact* lazy scheme (fp32, 1 distribution). For scale, the pipeline's
-forward activation is ~10 KB/token — the returned distribution is 8–90× larger.
-
-**Generalizes by vocab** (one distribution = `V·b`; per-token = `V·b / T_round`):
-
-| Model family | V | fp16 dist | fp32 dist |
-|---|---|---|---|
+| Model family | Vocab | fp16 | fp32 |
+|---|--:|--:|--:|
 | Llama-2 / Mistral-7B | 32,000 | 62 KB | 125 KB |
 | GPT-2 / Pythia | ~50,300 | 98 KB | 196 KB |
-| Llama-3.x (ours) | 128,256 | 250 KB | 501 KB |
-| Mistral-Small-24B (repo) | 131,072 | 256 KB | 512 KB |
+| Llama-3.x | 128,256 | 250 KB | 501 KB |
+| Mistral-Small-24B | 131,072 | 256 KB | 512 KB |
 | Qwen2.5 | 151,936 | 297 KB | 594 KB |
 | Gemma-2/3 | 256,000 | 500 KB | 1000 KB |
 
-**WiFi projection** (from the two-node data: 256 KB fp16 ≈ 28 ms one-way), pure return time:
+Acceptance vs draft temperature (α / accepted per round, K=4, one prompt, seed 1; bold = row maximum):
 
-| scheme | return/round | return/token |
-|---|---|---|
-| naive (5 fp32 dists, current) | ~274 ms | **~96 ms/tok** |
-| lazy fp32 (1 dist) | ~55 ms | ~19 ms/tok |
-| lazy fp16 (1 dist) | ~27 ms | ~10 ms/tok |
-| **greedy (2 ints)** | ~0 ms | **~0 ms/tok** |
+| Target T \ Draft T | 0 (greedy) | 0.3 | 0.7 | 1.0 |
+|--:|:--|:--|:--|:--|
+| 0.3 | 0.372 / 2.44 | **0.523 / 2.97** | 0.382 / 2.50 | 0.436 / 2.71 |
+| 0.7 | 0.290 / 2.16 | 0.356 / 2.38 | **0.485 / 2.88** | 0.470 / 2.88 |
+| 1.0 | 0.245 / 1.98 | 0.129 / 1.48 | 0.375 / 2.50 | **0.429 / 2.71** |
 
-Since per-token compute here is ~50 ms, the distribution return is a 0.2–2× latency tax on a
-WiFi link that greedy erases entirely.
+![Draft temperature vs target temperature](figures/f6_temperature_grid.png)
 
-## Deliverable 2 — acceptance rate vs draft temperature
+α gap, temperature-matched draft minus greedy draft (5 prompts × 3 seeds):
 
-Prompt fixed, K=4, `--spec-seed 1`, warm. α (and mean accepted/verify) as `--draft-temp` sweeps
-under each target `T`:
-
-| target T \ draft T | 0 (greedy) | 0.3 | 0.7 | 1.0 |
-|---|---|---|---|---|
-| 0.3 | α 0.372 / 2.44 | **0.523 / 2.97** | 0.382 / 2.50 | 0.436 / 2.71 |
-| 0.7 | α 0.290 / 2.16 | 0.356 / 2.38 | **0.485 / 2.88** | 0.470 / 2.88 |
-| 1.0 | α 0.245 / 1.98 | 0.129 / 1.48 | 0.375 / 2.50 | **0.429 / 2.71** |
-
-α is **maximized when the draft temp matches the target temp** (bold), consistent with
-`α = 1 − TV(p_target@T, q_draft@Td)`. Greedy draft (Td=0) always proposes the mode, so it
-gives up α vs the temp-matched draft — the price of zero `q`-bandwidth. A mismatched non-zero
-draft temp can be *worse* than greedy (e.g. T=1.0, Td=0.3 → α 0.129). **(Single prompt / seed —
-generalized below.)**
-
-### Multi-prompt validation (5 prompts × 3 seeds × 3 temps, greedy vs temp-matched)
-
-The greedy-vs-matched α **gap is not a constant** — it grows with temperature and shrinks on
-structured text:
-
-| target T | mean gap | std | min | max |
-|---|---|---|---|---|
-| 0.3 | **−0.018** | 0.100 | −0.200 | 0.151 |
+| Target T | Mean gap | Std | Min | Max |
+|--:|--:|--:|--:|--:|
+| 0.3 | −0.018 | 0.100 | −0.200 | 0.151 |
 | 0.7 | +0.134 | 0.151 | −0.093 | 0.345 |
 | 1.0 | +0.257 | 0.171 | −0.032 | 0.626 |
 | all | +0.124 | 0.183 | −0.200 | 0.626 |
 
-At low temp greedy essentially **ties** matched (the draft's argmax is usually the target's
-mode); at high temp it gives up ~0.26. Per prompt (avg over seeds/temps): repetitive **+0.059**,
-reasoning **+0.068**, factual +0.146, prose +0.162, code **+0.185** — structured/repetitive text
-costs greedy almost nothing; creative/code costs most. So the earlier single-prompt "~0.18" was
-a mid-temp/prose point, not representative.
+By prompt type (mean over seeds and temperatures): repetitive +0.059, reasoning +0.068, factual +0.146, prose +0.162, code +0.185.
 
-## The honest single-node result
+Single-machine throughput, greedy draft vs temperature-matched draft (tok/s):
 
-On **localhost** the 2.5 MB return costs only ~5 ms/round, so the α loss dominates and greedy
-is a **net loss**: tok/s at (T, greedy vs temp-matched) = 0.3: 20.6 vs 23.9 · 0.7: 18.3 vs 23.6
-· 1.0: 16.6 vs 22.0. **Greedy draft is a bandwidth optimization, not a single-node one** — its
-whole payoff is the network return it removes, which only bites on a real link. Projected on
-WiFi it flips: greedy ≈ 19 tok/s vs ~7 (naive) / ~17–20 (lazy), while being simpler (no `q`
-state, accept fully on the verifier, exact — no fp16-on-wire approximation).
+| Target T | Greedy draft | Matched draft |
+|--:|--:|--:|
+| 0.3 | 20.6 | 23.9 |
+| 0.7 | 18.3 | 23.6 |
+| 1.0 | 16.6 | 22.0 |
 
-## Break-even vs the lazy-logits method (how much α greedy may give up)
+Break-even: the α drop a greedy draft may give up and still beat a lazy return of one distribution, `Δα_max = ΔR / (C + R_L) · (α_L + 1/K)`, with measured C ≈ 117 ms/round, α_L ≈ 0.5, K=4:
 
-Greedy trades acceptance rate for return bandwidth. When is that trade worth it vs the exact
-lazy method (draft-temp>0, returns K scalars + 1 distribution)? Per-token time in a synchronous
-round (emits `T=αK+1` tokens): `t=(C+R)/(αK+1)`, with `C` the per-round cost common to both
-(draft + target forward + activation send) and `R` the worker→coordinator return — the only
-difference (greedy `R_g≈0`; lazy `R_L≈` one distribution). Setting `t_greedy ≤ t_lazy`:
+| Link, return dtype | ΔR | Δα_max |
+|---|--:|--:|
+| localhost / Thunderbolt | 0.5–2 ms | 0.003–0.013 |
+| WiFi, fp16 | 28 ms | 0.145 |
+| WiFi, fp32 (exact) | 56 ms | 0.243 |
 
-```
-Δα_max = [ ΔR / (C + R_L) ] · (α_L + 1/K),   ΔR = R_L − R_g ≈ one-distribution transfer
-```
-
-Greedy's tolerable α **drop** scales with the fraction of the round spent shipping the
-distribution. With measured inputs (`C≈117 ms/round`, `α_L≈0.5`, `K=4`; transfer from the
-two-node data: 256 KB fp16 ≈ 28 ms WiFi, ~1 ms Thunderbolt):
-
-| link / dtype | ΔR | Δα_max | vs observed drop ≈ 0.18 |
-|---|---|---|---|
-| localhost / Thunderbolt | 0.5–2 ms | 0.003–0.013 | greedy loses badly |
-| WiFi, fp16 lazy (approx) | 28 ms | 0.145 | ~tie / slight loss |
-| **WiFi, fp32 lazy (exact)** | 56 ms | **0.243** | **greedy wins** |
-
-**Threshold:** against the *exact* lazy method (which must ship fp32), greedy tolerates an α
-drop of up to **~0.24** on WiFi (≈ one accepted token/round, `K·Δα≈1`) — collapsing to ~0.01 on
-Thunderbolt/localhost. Sensitivity to compute: `Δα_max` = 0.36 at `C=60 ms`, 0.16 at
-`C=200 ms` (WiFi fp32) — faster compute favors greedy.
-
-**Verdict, evaluated per-case on the multi-prompt sweep** (projecting WiFi per-token time from
-each case's *measured* `T_round`, `C=117 ms`, fp32 return 56 ms / fp16 28 ms):
-
-| vs lazy | greedy wins | mean proj tok/s (greedy vs lazy) |
-|---|---|---|
-| exact (fp32) | **34/45 (76%)** | **25.6 vs 20.0** |
-| approx (fp16) | 26/45 (58%) | 25.6 vs 23.8 |
-
-Per temp (WiFi proj tok/s, greedy / lazy-fp32 / lazy-fp16): T=0.3 **31.4 / 20.8 / 24.8** · T=0.7
-**25.5 / 20.1 / 24.0** · T=1.0 **19.8 / 19.0 / 22.7**. So **greedy clearly wins vs the exact
-lazy method at low–mid temperature and on structured prompts**, narrowing to a tie at T=1.0
-(where its α gap balloons to ~0.26). Against an *approximate* fp16 lazy it's roughly a wash
-(and loses at T=1.0) — but greedy stays exact and simpler (no `q` state, accept fully on the
-verifier). On Thunderbolt/localhost greedy loses everywhere (return is nearly free). Caveat:
-assumes a synchronous pipeline; async overlap (Milestone C) would hide `R` and shrink greedy's
-edge.
-
-## Correctness
-
-- **Exactness of the greedy-draft path — confirmed.** Empirical first-emitted-token
-  distribution vs the target's exact `p*`, TV distance as a z-score against the
-  direct-multinomial noise floor: T=0.3 z=0.60 (N=800), T=1.0 z=1.70 (N=800), T=0.8 z=0.39
-  (N=2000). T=0.8 read z=2.22 at N=800 but **fell to 0.39 at N=2000** — a real bias grows with
-  √N, so shrinking confirms it was sampling noise. (`verify_accept` is algebraically identical
-  to the validated `spec_accept` with a point-mass `q`: `min(1,p/1)=p`, `max(0,p−δ)` = `p`
-  with the drafted id zeroed.)
-- **Reproducible:** same `--spec-seed` → byte-identical transcript.
-- **No regression:** `--temperature 0` still byte-identical to `baseline.out`.
-
-New primitives: `PartialModel.verify_accept`; endpoint `/verify_accept`; Rust
-`verify_accept` + `--draft-temp` + `verify_ret_bytes` instrumentation.
-
-## Next
-
-Milestone B makes this the worker-side primitive: worker runs verify+accept and returns
-`(a, final)` over TCP — the greedy-draft lazy return *is* the distributed win projected above.
+**Result.** A greedy draft removes the return payload entirely at a cost in acceptance that is near zero at low temperature and ~0.26 at T=1.0. On one machine that trade loses; on WiFi the tolerable α drop (0.24 vs fp32) exceeds the observed drop, so it wins. Acceptance is maximized when the draft's temperature matches the target's.
 
 ---
 
-# Step 3 — Milestone B: distributed speculative decoding (correctness, loopback)
+## 6. Two-machine speculative decoding, Llama-3.2-3B
 
-Draft runs entirely on the coordinator; the target is split coordinator-shard (layers 0..14) +
-worker-shard (14..28). Each round: draft K, forward all K+1 through the local shard, ship once to
-the worker, accept, roll back **all three** KV caches (draft, local shard, worker-over-TCP) by
-`k−a`. New TCP frames: `Trim`, `Verify`/`VerifyResult`, `LogitsAt` (+ a small `aux: Vec<u32>`
-side-channel on every frame). Dispatch: `--mode coordinator --spec-k K --draft-model <url>`.
+**Setup.** Draft Llama-3.2-1B-4bit on the coordinator; target Llama-3.2-3B-4bit split coordinator 0–14 / worker 14–28. Greedy draft and target, K=4, 200 generated tokens, one warm-up discarded. Spec-off baseline is the plain pipeline on the same servers in the same session. August 23, 2026.
 
-**All gates run as 4 processes on one M2 Air over loopback TCP** — a functional/correctness check,
-not a perf headline (all shards contend for one GPU). The two-Mac Thunderbolt/WiFi benchmark is
-deferred until after these pass.
+| Prompt tokens | TB off | **TB spec** | TB × | WiFi off | **WiFi spec** | WiFi × | α | accepted / verify |
+|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| 12 | 21.3 | **24.1** | 1.13 | 12.0 | **18.2** | 1.52 | 0.544 | 3.16 |
+| 59 | 20.7 | **24.3** | 1.17 | 11.2 | **18.3** | 1.63 | 0.544 | 3.16 |
+| 110 | 18.9 | **25.9** | 1.37 | 11.3 | **19.8** | 1.75 | 0.616 | 3.43 |
+| 256 | 19.2 | **25.8** | 1.34 | 8.8 | **19.1** | 2.17 | 0.608 | 3.43 |
 
-## Correctness
+![Two-machine speculative decoding headline](figures/f10_headline.png)
 
-- **Greedy (temp 0) — byte-identical to the non-spec two-node pipeline** (`run_coordinator`) across
-  3 prompts × K∈{1,2,4} (all 9 exact, 80 tokens each). Byte-identity across varying K (hence varying
-  accept counts) is also the cache-rollback proof: any `trim` desync across the three caches would
-  corrupt later tokens. Worker returns its per-position **argmax ids** — the greedy lazy return is
-  `(K+1)×4 = 20 B/round`, never the 256 KB logits the plain pipeline ships per token.
-- **Sampled (temp>0) — byte-identical to single-node `run_spec_loop`** across 2 prompts ×
-  {K∈{2,4}, T∈{0.8,0.3}}, seeded (`--spec-seed`). The two-phase lazy return
-  (`accept_scalars`→`logits_at`→`resample_at`) replicates `spec_accept`'s exact RNG stream, so
-  equality is byte-level, not just statistical.
-- **Reproducible:** same `--spec-seed` → identical transcript.
+Round-trips per emitted token: 0.29–0.32 (vs 1.0 for the plain pipeline). Verifier return: 20 B/round (vs 256 KB/token).
 
-## Wire (measured on loopback via the round stats)
+Per-stage medians at p256 (spec rows are per round ≈ 3.43 emitted tokens):
 
-- Greedy K=4: α≈0.60, mean_accepted/verify≈3.3, **round_trips/tok≈0.30** (one worker round-trip per
-  ~3.3 emitted tokens vs exactly 1.0 for the non-spec pipeline), verify_ret **20 B/round**.
-- Sampled K=4 T=0.8: α≈0.50, mean_accepted/verify≈2.95, return **≈513 KB/round** = exactly **one**
-  full fp32 distribution (128256×4 B) + the K+1 scalars — vs the naive K+1 distributions (~2.5 MB).
-  The lazy return collapses the sampled return to one distribution per *round* instead of per *token*.
+| Case | local | network | worker | round-trip |
+|---|--:|--:|--:|--:|
+| WiFi off (per token) | 23.9 ms | 44.3 ms | 22.6 ms | 68.3 ms |
+| WiFi spec (per round) | 87.5 ms | 12.8 ms | 45.4 ms | 57.4 ms |
+| TB off (per token) | 23.0 ms | 0.87 ms | 22.7 ms | 23.6 ms |
+| TB spec (per round) | 86.0 ms | 0.75 ms | 39.8 ms | 40.6 ms |
 
-New primitives: TCP `Trim`/`Verify`/`VerifyResult`/`LogitsAt` frames + `Frame.aux`;
-`run_spec_coordinator`, `verify_exchange`, `logits_at_exchange`, worker Verify/LogitsAt/Trim arms;
-`PartialModel.verify_scalars`/`logits_at`/`accept_scalars`/`resample_at`; endpoints
-`/verify_scalars`, `/logits_at`, `/accept_scalars`, `/resample_at`; client methods to match.
-
-## Next
-
-The two-Mac benchmark below.
+**Result.** 1.13–1.37× on Thunderbolt and 1.52–2.17× on WiFi. The draft compute that made speculation a loss on one machine (~50 ms/round in `local`) is amortized over 3.4 tokens and hidden behind the round-trips it removes; the WiFi network stage drops from 44 ms/token to ~3.7 ms/token.
 
 ---
 
-# Step 3 — Milestone B: distributed speculative decoding, TWO physical machines (the headline)
+## 7. Decomposition: speculation × return mode
 
-Draft: Llama-3.2-1B-Instruct-4bit (coordinator-local) · Target: Llama-3.2-3B-Instruct-4bit,
-split coordinator 0..14 / worker 14..28
-Coordinator: 2023 MacBook Air, M2, 8 GB RAM (draft :8766 + target shard 0..14 :8765 + Rust coordinator)
-Worker: 16 GB Mac (target shard 14..28 :8765 + Rust `--mode worker --listen 9000`)
-Transports: Thunderbolt bridge (worker `10.0.0.2`) and WiFi (worker `192.168.4.77`), both to `:9000`
-Date: August 23, 2026
+**Setup.** Same Llama pair and split. `--return-mode naive|lazy` is independent of `--spec-k`, giving four cells: **A** spec off + naive return (worker ships the full 256 KB distribution per token), **B** spec off + lazy return (worker samples, returns the token id), **C** spec on + naive return (worker ships K+1 distributions per round), **D** spec on + lazy return (20 B per round). Greedy, K=4, averaged over the four prompt lengths. 144 runs, 0 failures. August 23, 2026.
 
-The first real two-machine timing of distributed spec decoding — every earlier spec number was
-single-node (net loss, expected) or loopback-only (all shards contend for one GPU). Greedy (temp 0),
-draft greedy (temp 0), so the worker returns per-position argmax ids: the **greedy lazy return, 20 B/round**
-vs the 256 KB/token the non-spec pipeline ships. K=4, 200 generated tokens/run, one warm-up discarded.
-Driver: `scripts/run_sweep_specB.sh`. Baseline (spec-off) = `run_coordinator` on the same servers,
-same session, run-for-run against the spec-on arm.
-
-## Correctness — byte-identical gate ✅ (on hardware)
-
-Greedy spec output is **byte-identical to the spec-off two-node pipeline** for all 4 prompts, **and
-identical across Thunderbolt vs WiFi** (8/8 diffs clean). The network split and the three-way cache
-rollback (draft + local shard + worker-over-TCP) are lossless on real machines, not just loopback.
-
-## Throughput — spec-off vs spec-K4, per transport (tok/s, steady-state)
-
-| Prompt tok | TB off | **TB spec** | TB × | WiFi off | **WiFi spec** | WiFi × | α | acc/verify |
-|-----------:|-------:|------------:|-----:|---------:|--------------:|-------:|----:|-----------:|
-|         12 |   21.3 |    **24.1** | 1.13 |     12.0 |      **18.2** |  1.52 | 0.544 | 3.16 |
-|         59 |   20.7 |    **24.3** | 1.17 |     11.2 |      **18.3** |  1.63 | 0.544 | 3.16 |
-|        110 |   18.9 |    **25.9** | 1.37 |     11.3 |      **19.8** |  1.75 | 0.616 | 3.43 |
-|        256 |   19.2 |    **25.8** | 1.34 |      8.8 |      **19.1** |  2.17 | 0.608 | 3.43 |
-
-round-trips/emitted-token ≈ **0.29–0.32** (one worker exchange per ~3.2–3.4 emitted tokens) vs exactly
-**1.0** for the non-spec pipeline; verify return **20 B/round** vs 256 KB/token.
-
-## The result
-
-- **WiFi is where it lands: up to 2.17× (P250), 1.5–1.8× across the board.** Spec decoding erases the
-  256 KB/token logits return that our own step-2 data proved was the WiFi bottleneck — the greedy lazy
-  return is 20 B/round, and there's only ~0.3 round-trips per token. **On Thunderbolt the win is smaller
-  (1.13–1.37×)** because the return was already nearly free there (network ~0.8 ms); spec still helps by
-  batching the worker forward, but there's no round-trip cost to amortize.
-- **Spec collapses the transport gap.** Baseline WiFi runs at 0.46–0.56× of Thunderbolt (the network
-  tax). Spec-on WiFi (18–20 tok/s) reaches **0.74–0.79× of spec-on TB** (24–26) — the two transports
-  nearly converge, because the link is hit ⅓ as often and returns almost nothing.
-- **Speedup grows with prompt length**, most sharply on WiFi (1.52× → 2.17×): the non-spec baseline
-  degrades as context grows (WiFi P250 collapses to 8.8 tok/s under the 8 GB coordinator's prefill
-  memory pressure), while spec stays flat at ~19 — spec is *more* robust to the pressure that hurts the
-  plain pipeline.
-
-## Mechanism — per-stage medians (P250; spec µs are per *round* ≈ 3.43 emitted tokens)
-
-| case | local | network | worker | round-trip |
-|---|------:|--------:|-------:|-----------:|
-| WiFi off  (per token) |  23.9 ms | **44.3 ms** | 22.6 ms | 68.3 ms |
-| WiFi spec (per round) |  87.5 ms | **12.8 ms** | 45.4 ms | 57.4 ms |
-| TB off    (per token) |  23.0 ms |   0.87 ms | 22.7 ms | 23.6 ms |
-| TB spec   (per round) |  86.0 ms |   0.75 ms | 39.8 ms | 40.6 ms |
-
-Per **emitted token** (÷3.43), WiFi spec's network stage is ~3.7 ms vs the baseline's 44.3 ms — a ~12×
-cut, from (a) the 20 B return replacing 256 KB and (b) one round-trip per ~3.4 tokens. `local` rises to
-~88 ms/round because it now runs the 1B draft (~50 ms) + a K+1-wide local-shard forward, but amortized
-over 3.43 tokens (~26 ms/tok) it's on par with the baseline's 24 ms/tok — **the draft compute that made
-spec a net loss single-node is hidden behind the network round-trip it removes.** This is exactly the
-distributed-regime argument from the Milestone-A notes, now measured.
-
-## Notes / honesty
-
-- tok/s is `gen_tokens / (t - t_first)` — prefill/ttft excluded, so these are steady-state. Raw
-  per-token CSVs in `bench_out/specB/{tb,wifi}_{10,50,100,250}_{off,specK4}.csv`.
-- α rises with the longer, more structured prompts (0.544 → 0.616), pulling acc/verify 3.16 → 3.43 and
-  round-trips/tok 0.317 → 0.291 — consistent with the capped-geometric 1/E[A] law (step-4 E3).
-- This is the **synchronous** pipeline: draft and verify still alternate. The win here is fewer, cheaper
-  round-trips; the *bubble* itself (local and worker still run serially within a round) is only fully
-  killed by async overlap (Milestone C).
-
-## Next
-
-The decomposition sweep below (naive vs lazy return made an independent axis) + the K-sweep.
-
----
-
-# Step 4 — Decomposition: speculation vs. the lazy return are separate axes (two Macs)
-
-Model / hardware as above (3B target split 0..14 / 14..28; 1B draft on coordinator; 8 GB Air +
-16 GB worker). Date: August 23, 2026.
-
-The earlier headline changed **two** things at once (speculation *and* the lazy logits return), so it
-couldn't say how much each contributed. The binary now exposes `--return-mode naive|lazy` as an axis
-**independent** of `--spec-k`, so all four cells of the 2×2 are reachable. Driver:
-`scripts/run_matrix.py` (144-run cross-product → one `bench_out/matrix/results.csv`; per-run CSV/out/err
-alongside). **Correctness:** the greedy 2×2 (A/B/C/D) is byte-identical across all four cells and to the
-single-node greedy transcript (verified on loopback before the sweep); sampled cells reproduce per seed.
-
-- **A** = spec-off, naive return (the original baseline: ship the full 256 KB distribution, sample on coord)
-- **B** = spec-off, lazy return (worker samples, returns the token id — a few bytes)
-- **C** = spec-on, naive return (worker ships **K+1** full distributions/round; coordinator accepts)
-- **D** = spec-on, lazy return (the headline: 20 B/round greedy)
-
-## The 2×2 — greedy, K=4, avg tok/s across the 4 prompt lengths
-
-| | naive return | lazy return |
-|---|---:|---:|
+| | Naive return | Lazy return |
+|---|--:|--:|
 | **Thunderbolt**, spec off | 18.8 (A) | 20.5 (B) |
-| **Thunderbolt**, spec on  | 22.0 (C) | 23.2 (D) |
-| **WiFi**, spec off        | 8.4 (A)  | 14.0 (B) |
-| **WiFi**, spec on         | **5.4 (C)** | **18.9 (D)** |
+| **Thunderbolt**, spec on | 22.0 (C) | 23.2 (D) |
+| **WiFi**, spec off | 8.4 (A) | 14.0 (B) |
+| **WiFi**, spec on | **5.4 (C)** | **18.9 (D)** |
 
-Return payload per the same runs: A = 256 KB/token · B = **4 B/token** · C = 2,565,120 B/round
-(= (K+1)·V·4 = 5 · 128 256 · 4) · D = **20 B/round**.
+Return payload: A 256 KB/token · B 4 B/token · C 2,565,120 B/round · D 20 B/round.
 
-## Decomposition (speedup vs. the A baseline)
+| Effect (vs A) | Thunderbolt | WiFi |
+|---|--:|--:|
+| Lazy return alone (B/A) | 1.09× | **1.67×** |
+| Speculation alone (C/A) | 1.17× | **0.64×** |
+| Both (D/A) | **1.23×** | **2.25×** |
 
-| effect | Thunderbolt | WiFi |
-|---|---:|---:|
-| **lazy return alone** (B/A) | 1.09× | **1.67×** |
-| **speculation alone** (C/A) | 1.17× | **0.64×** ⟵ a *regression* |
-| **both** (D/A) | 1.23× | **2.25×** |
+![The 2×2 decomposition](figures/f1_decomposition.png)
 
-**The headline finding.** On the slow link the two axes are not even the same sign:
-- **Speculation *by itself* is a net loss on WiFi (0.64×).** With a naive return, K=4 spec ships K+1 full
-  distributions per round — ~725 KB/emitted-token vs the baseline's 256 KB — so it *adds* wire traffic on
-  the link where traffic is the bottleneck. The thing every distributed-spec paper hand-waves as
-  "communication overhead" is here large enough to erase the entire speedup and then some.
-- **The lazy return is what makes distributed speculation pay** (0.64× → 2.25× once combined). It is not a
-  minor bandwidth tweak; it is the load-bearing piece on commodity WiFi.
-- **On Thunderbolt the balance flips:** the return is nearly free, so lazy adds little (1.09×) and the win
-  is mostly speculation (1.17×). Fast link → speculation is the lever; slow link → the lazy return is.
+Network stage per cell (WiFi, p256, median):
 
-This is the clean, differentiated result the testbed was built for: *"if you add distributed speculation
-to a pipeline over a real network, you get 2.25× — but only with the lazy return; without it you get
-0.64×."*
+| Cell | Network | Unit |
+|---|--:|---|
+| A off, naive | 31.7 ms | per token |
+| B off, lazy | 9.3 ms | per token |
+| C on, naive | **323.3 ms** | per round |
+| D on, lazy | 11.9 ms | per round |
 
-## Mechanism — per-stage network median (WiFi, p256, greedy K=4)
+![One RTT and one bandwidth explain every WiFi cell](figures/f11_network_model.png)
 
-| cell | network/round (ms) | note |
-|---|---:|---|
-| A off-naive | 31.7 (per token) | the 256 KB return |
-| B off-lazy  | 9.3 (per token)  | 4 B return; just the ~6 KB activation out |
-| **C on-naive** | **323.3 (per round)** | the 2.5 MB (K+1 dists) return — this is the 0.64× |
-| D on-lazy   | 11.9 (per round) | 20 B return; ~30 KB activation out for K+1 tokens |
+K sweep with the lazy return (greedy, averaged over prompts):
 
-The 323 ms/round to ship 2.5 MB back over WiFi is the whole story of cell C's collapse.
-
-## Lazy K-sweep (greedy, avg over prompts) — optimal K and the bandwidth tilt
-
-| K | TB tok/s | WiFi tok/s | α | round-trips/tok |
-|--:|---:|---:|---:|---:|
+| K | TB tok/s | WiFi tok/s | α (accepted fraction) | round-trips / token |
+|--:|--:|--:|--:|--:|
 | 1 | 19.7 | 15.0 | 0.792 | 0.559 |
 | 2 | 21.4 | 17.6 | 0.700 | 0.418 |
 | 4 | **23.2** | **18.9** | 0.578 | 0.304 |
 | 6 | 21.6 | 18.2 | 0.481 | 0.261 |
 
-Both peak at **K=4** here, but the *shape* tilts as predicted (step-4 E2/E8, "optimal K rises as bandwidth
-falls"): relative to K=1, K=6 is 1.10× on TB but **1.21× on WiFi** — a more expensive round-trip rewards
-amortizing over more speculative tokens, so WiFi holds its gain further out. α falls with K and
-round-trips/tok tracks the 1/E[A] law.
+Sampled target at T=0.7, K=4, lazy return, greedy draft vs temperature-matched draft:
 
-## Temperature > 0 — greedy-draft is a bandwidth optimization (measured on WiFi)
+| Draft temperature | α | TB tok/s | WiFi tok/s | Return |
+|--:|--:|--:|--:|---|
+| 0 (greedy) | 0.448 | 18.9 | **15.6** | ~8 B/round |
+| 0.7 (matched) | 0.496 | 18.3 | 11.3 | one 513 KB distribution/round |
 
-Lifting the old `temp>0 ⇒ draft-temp>0` restriction lets the draft run greedy at temp>0 (worker-side
-`verify_accept`, no distribution on the wire). T=0.7, lazy, K=4, avg over prompts:
-
-| draft temp | α | TB tok/s | WiFi tok/s | return |
-|---|---:|---:|---:|---|
-| 0 (greedy draft) | 0.448 | 18.9 | **15.6** | ~8 B/round |
-| 0.7 (matched)    | 0.496 | 18.3 | 11.3 | one 513 KB dist/round |
-
-The matched draft accepts more (α 0.496 vs 0.448) but must ship one full distribution per round; on WiFi
-that costs more than the extra acceptance buys (**15.6 vs 11.3 tok/s**), while on Thunderbolt they tie.
-So the greedy-draft lazy return — lower α, ~zero bytes — is the better WiFi choice: the single-node
-projection from the Aug-23 notes, now confirmed on a real link.
-
-## Notes / honesty
-
-- Greedy, steady-state tok/s (prefill/ttft excluded), K=4 unless noted; 2×2 numbers averaged over the 4
-  prompt lengths. All 144 runs completed, 0 failures. Full table: `bench_out/matrix/results.csv`.
-- Naive is restricted to K=4 in the sweep (the full naive K-sweep just re-measures the same
-  return-bytes cost at more K; `NAIVE_KS` in the driver opens it up).
-- Still the **synchronous** pipeline — draft and verify alternate. These wins are from cheaper/fewer
-  round-trips, not bubble overlap (that's Milestone C).
-
-## Next
-
-fp16-on-the-wire for the temp>0 lazy distribution (halves the 513 KB matched-draft return), then the
-README + write-up anchored on the decomposition above. Async overlap (Milestone C) is the remaining
-stretch.
+**Result.** On WiFi the two axes have opposite sign: speculation with a naive return is a 0.64× regression (2.5 MB back per round costs 323 ms) and the lazy return alone is 1.67×; together they give 2.25×. On Thunderbolt the return is nearly free, so speculation is the lever (1.17×) and the lazy return adds 1.09×. K=4 is optimal on both links; the gain from larger K holds further out on the slower link.
 
 ---
 
-# Step 5 — Scaling to 14B: the float16/bfloat16 wire bug, and where spec actually stands
+## 8. Qwen3-14B
 
-Target: **Qwen3-14B-4bit**, split coordinator `0..8` / worker `8..40` · Draft: **Qwen3-1.7B-4bit** (coordinator-local)
-Coordinator: 2023 MacBook Air, M2, **8 GB** (draft :8766 + target shard 0..8 :8765 + Rust coordinator)
-Worker: **Apple M4, 16 GB** (`arjungarg@192.168.4.77`; target shard 8..40 :8765 + Rust `--mode worker`)
-Transport: WiFi (`192.168.4.77:9000`); Thunderbolt was down this session. Greedy, 100 generated tokens.
-Date: August 27, 2026
+**Setup.** Target Qwen3-14B-4bit (40 layers), coordinator 0–8 / worker 8–40. Draft on the coordinator. Greedy, WiFi. August 27, 2026.
 
-We moved to a 14B target (with a 1.7B draft) and found distributed spec was a **net loss** — worse than
-the plain pipeline. Chasing "why is verify so expensive" led, after several wrong turns (see honesty),
-to a **one-character dtype bug on the wire** that silently disabled batched matmul on every
-over-the-wire forward. Fixing it made the whole system 1.2–1.7× faster and moved the bottleneck off
-verify entirely. **After the fix, spec ties the plain pipeline** — it no longer loses, but it doesn't
-win, because acceptance (α≈0.43 for this draft/target) is now the binding constraint, not verify cost.
+### 8a. Activation dtype on the wire
 
-## The bug — float16 activations disable the bfloat16 batched matmul
+Qwen3 computes in bfloat16; activations were serialized as float16. A float16 input to a bfloat16 quantized matmul takes an unbatched per-row path, so a T-token verify cost about T single forwards. The fix casts incoming activations to the model's compute dtype at the shard boundary.
 
-Qwen3 computes in **bfloat16**, but the wire protocol serializes activations as **float16**
-(`tensor_response`/`tensor_from_request`, `Frame` dtype). Feeding a float16 activation into a
-bfloat16-weight `quantized_matmul` drops it onto an **unbatched per-row path** — so a T-token verify
-costs ~T× a single forward instead of batching. It's purely the dtype; numpy-vs-MLX origin, contiguity,
-and eval-state are all irrelevant.
+Worker shard 8–40, 256-token context, one forward of T tokens (ms):
 
-`decode_step`, worker shard 8..40, N=256 context, in-process (ms), by **input dtype**:
+| T | bf16 input | f16 input (wire, before fix) | f16 → cast to bf16 (after fix) |
+|--:|--:|--:|--:|
+| 1 | 64 | 89 | 62 |
+| 5 | 117 | 322 | 117 |
+| 9 | 224 | **642** | 224 |
 
-| T | embed input (bf16) | wire round-trip (stays f16) | round-trip → cast to bf16 |
-|--:|-------------------:|----------------------------:|--------------------------:|
-| 1 |                 64 |                          89 |                        62 |
-| 5 |                117 |                         322 |                       117 |
-| 9 |                224 |                     **642** |                       224 |
+End to end, 100 generated tokens, WiFi:
 
-The f16 column is **linear in T (~65 ms/token)** — no batching; the bf16 columns batch (T=9 ≈ 3.5× T=1).
-Through the actual uvicorn MLX server the f16 path reproduces exactly: `/forward` decode is 98 / 182 /
-324 / **643** ms at T = 1/3/5/9. **That 643 ms is the "710 ms at T=9" that framed the whole
-investigation** — it was real, and it was this bug. (The misleading number was the in-process microbench:
-`embed()` returns bf16, so it accidentally measured the fast path the real system never uses.)
+| Case | Before fix (tok/s) | After fix (tok/s) | Worker per round, before → after |
+|---|--:|--:|--:|
+| Plain pipeline | 5.7 | **7.0** | 108 → 82 ms |
+| Spec 1.7B draft, K=2 (α 0.43) | 4.8 | **6.9** | 217 → 113 ms |
+| Spec 1.7B draft, K=4 (α 0.29) | 3.6 | **6.1** | 367 → 163 ms |
 
-## The fix
+![One dtype mismatch silently disabled batched verification](figures/f9_dtype_bug.png)
 
-Cast incoming activations to the model's compute dtype at the model boundary — 3 lines in
-`PartialModel` (`self.dtype = self.model.model.norm.weight.dtype`; `hidden_states.astype(self.dtype)` at
-the top of `prefill` and `decode_step`). Dtype-agnostic: a no-op for the fp16 Llama-3B, corrects the
-bf16 Qwen. The proper long-term fix is bf16 (or raw) activations on the wire so there's no lossy
-round-trip at all; the cast is the minimal correct patch.
+Verify cost on the M4 after the fix, T = 1 / 5 / 9 / 16 / 32 / 48 tokens: 65 / 124 / 240 / 309 / 313 / 615 ms (a plateau from T=16 to 32).
 
-## Throughput — before vs after the fix (WiFi, 100 tok, greedy)
+Per-stage means after the fix (WiFi, ms; spec rows per round):
 
-| case | pre-fix tok/s | post-fix tok/s | worker stage / round (pre → post) |
-|---|---:|---:|---|
-| baseline (off) | 5.7 | **7.0** | 108 → 82 ms |
-| spec K=2 (α 0.43) | 4.8 | **6.9** | 217 → **113 ms** |
-| spec K=4 (α 0.29) | 3.6 | **6.1** | 367 → **163 ms** |
-
-Verify now batches (K=4 worker 367 → 163 ms, 2.2×). The full verify-cost curve on the M4 worker (layers
-8..40 + lm_head, N=256) confirms the batched shape: T = 1/5/9/16/32/48 → 65 / 124 / 240 / 309 / **313** /
-615 ms — a ramp to T≈16, then a **plateau T=16..32** (313 ms for 16 *or* 32 tokens; per-token floor
-~10 ms), then a tile step at T=48. So a wide tree (≤32 candidates) would verify for the price of ~T=16 —
-but see the verdict: verify is no longer the constraint.
-
-## Per-stage breakdown — baseline vs spec (WiFi, mean per stage, ms)
-
-`local` = draft (K+1 sequential 1.7B forwards on the coordinator) + coordinator shard-0..8 forward.
-Spec rows are per **round**; divide by accepted/round for per emitted token.
-
-| step | baseline / token | spec K=2 / round | spec K=4 / round |
-|---|---:|---:|---:|
-| draft + coord fwd (0..8) | 31.7 | **98.3** | 151.4 |
-| network (wire RT) | 18.5 | 37.7 | 28.5 |
-| worker (8..40 + lm_head) | 79.0 | 112.3 | 163.2 |
-| **per round** | **129** | **248** | **343** |
+| Stage | Plain, per token | Spec 1.7B K=2, per round | Spec 1.7B K=4, per round |
+|---|--:|--:|--:|
+| draft + coordinator shard | 31.7 | 98.3 | 151.4 |
+| network | 18.5 | 37.7 | 28.5 |
+| worker | 79.0 | 112.3 | 163.2 |
+| **total** | **129** | **248** | **343** |
 | accepted / round | 1.0 | 1.87 | 2.15 |
-| **per emitted token** | **129 → 7.7 tok/s** | **133 → 7.5** | **160 → 6.3** |
+| **per emitted token** | **129 ms → 7.7 tok/s** | **133 ms → 7.5** | **160 ms → 6.3** |
 
-Self-consistent (stages sum to ≈ the run's tok/s after ttft). The tie is real and **compute-dominated,
-not a network artifact**: the two big costs are the worker verify and the draft+coord forward; network
-is ~15%.
+**Result.** The cast made the whole system 1.2–1.7× faster. With the 1.7B draft speculation then ties the plain pipeline (7.5 vs 7.7 tok/s): verify is no longer the constraint, acceptance (α 0.43) and draft cost on the 8 GB coordinator are.
 
-## The verdict — verify is solved; acceptance and draft cost are the wall now
+**Caveat.** After the fix, batched verify (gemm) and single-token decode (gemv) round differently in bf16, so greedy spec-on and spec-off transcripts share a long prefix and then diverge on a near-tie argmax. See [Correctness](#correctness).
 
-- **Spec no longer loses — it ties** (baseline 7.7, spec K=2 7.5 tok/s). The verify-cost problem that
-  looked like the villain all thread is a non-issue post-fix.
-- **It doesn't win because α≈0.43** → only 1.87 tokens amortize each round. The 1.7B draft just isn't a
-  good enough guesser of the 14B on these prompts.
-- **The largest spec-specific tax is the draft, not verify**: `local` triples 32 → 98 ms/round, because
-  the draft runs K+1 sequential 1.7B forwards on the **8 GB M2 Air coordinator** — the weakest machine in
-  the cluster. A faster coordinator or a cheaper/better-matched draft attacks this directly.
+### 8b. Draft sweep
 
-## Thunderbolt — predicted, and why the "spec saves round-trips" intuition doesn't fire here
+**Setup.** Same split, WiFi, greedy, 150 generated tokens, drafts Qwen3-0.6B-4bit and Qwen3-1.7B-4bit, K ∈ {1, 2, 3, 4}, one run per cell.
 
-Swapping the wire time for ~1 ms (TB) from the same breakdown:
+| Draft | K | p110 tok/s | p256 tok/s | α (p110 / p256) | accepted / round (p110) | local ms/round | worker ms/round |
+|---|--:|--:|--:|:--|--:|--:|--:|
+| none (baseline) | 0 | 6.2 | 6.0 | — | 1.00 | 37 | 87 |
+| 0.6B | **1** | **8.4** | **7.2** | 0.72 / 0.59 | 1.71 | 64 | 98 |
+| 0.6B | 2 | 7.9 | 7.7 | 0.53 / 0.51 | 2.04 | 91 | 116 |
+| 0.6B | 3 | 7.7 | 6.8 | 0.46 / 0.41 | 2.37 | 113 | 148 |
+| 0.6B | 4 | 7.0 | 6.3 | 0.40 / 0.37 | 2.61 | 136 | 178 |
+| 1.7B | 1 | 7.1 | — | 0.73 / — | 1.73 | 83 | 98 |
+| 1.7B | 2 | 7.5 | 7.2 | 0.63 / 0.55 | 2.26 | 120 | 111 |
+| 1.7B | 3 | 7.4 | — | 0.52 / — | 2.57 | 142 | 139 |
+| 1.7B | 4 | — | — | — | — | — | — |
 
-| | WiFi | Thunderbolt (predicted) |
-|---|---:|---:|
-| baseline | 7.74 | 8.95 |
-| spec K=2 | 7.53 | 8.84 |
+![Draft sweep on the 14B](figures/f8_draft_sweep.png)
 
-Spec does **not** get worse on TB — it stays tied. Reason: spec's round-trips are **fewer but fatter**.
-It ships the whole `[1, K+1, D]` activation per round (3× the bytes) at 0.53 round-trips/token, so its
-network cost *per token* (37.7 / 1.87 = 20 ms) ≈ baseline's (18.5 ms) — the fewer-round-trips advantage
-is cancelled by the bigger payload. Removing network helps both about equally. The "spec saves
-round-trips" win from Milestone B (the 3B, where the *return* was 256 KB and dominated) only reappears on
-a **high-latency** link (slow WiFi / WAN) where round-trip latency dominates payload size. On this
-~18 ms WiFi it's a small, latency-light regime, so the transport barely moves the verdict. (Not yet
-verified on hardware — TB was down; arithmetic only.)
+**Result.** The 0.6B draft at K=1 is 1.35× (p110) and 1.20× (p256) over the plain pipeline. The 1.7B draft accepts no more at K=1 (α 0.73 vs 0.72) but costs 19 ms/round more on the Air, so the cheaper draft wins. K=1 is optimal: from K=1 to 4 accepted tokens per round rise 1.71 → 2.61 while the round cost rises 134 → 231 ms.
 
-## Correctness — the fix broke strict greedy byte-identity (expected, not a logic bug)
+**Caveat.** Four 1.7B cells (marked —) were lost to WiFi timeouts and are reported as absent. Per-stage means undercount the measured per-token time here by WiFi tail latency; use the tok/s columns for speedups.
 
-Post-fix, greedy `spec-off` and `spec-on` **diverge** (~token 30: "for each new token" vs "for
-subsequent token") — a long shared prefix, then an argmax flip on a near-tie. Cause: **batched verify
-(gemm) vs single-token decode (gemv) produce bit-different logits** in bf16. Pre-fix they matched *only*
-because the dtype bug forced both onto the identical unbatched per-row path. The output text also changed
-(post-fix runs in native bf16, which matches true single-node greedy; the pre-fix fp16 path was the
-degraded one). Both outputs are valid greedy decodes, but the **Milestone-B byte-identity invariant no
-longer holds** — a decision to make: accept it as standard spec numerics, or chase bit-exactness (rarely
-worth it).
+---
 
-## Notes / honesty
+## 9. Head-to-head vs exo
 
-- **The microbench lied for most of this investigation.** In-process `decode_step` from `embed()` runs
-  bf16 (fast path); the real system serializes to fp16 on the wire (slow path). Reasoning from the
-  microbench produced a string of wrong root-causes — a "compute roofline" (killed by the 3–6%-of-peak
-  arithmetic), "memory contention" (refuted by a 30%↔53%-free test that moved nothing), and a
-  "gemv/gemm tile staircase" (contradicted by the worker's own K-sweep). The decisive move was a
-  controlled **synthetic-vs-real** comparison on one machine, then isolating the single differing
-  variable (input dtype).
-- Worker is an **M4** (faster than the M2 Air coordinator and batches better — T8/T1 ≈ 3× vs the Air's
-  ~6×); earlier "710 ms = worker compute" attributions conflated the fp16 server path with raw compute.
-- tok/s excludes ttft (steady-state). CSVs: `/tmp/fix_{off,specK2,specK4}.csv` this session (re-run into
-  `bench_out/` before committing). α here (0.43) is below the 3B/1B pair's 0.54–0.62 — smaller draft
-  relative to a harder target.
-- This is still the synchronous pipeline (draft and verify alternate); async overlap (Milestone C) is
-  orthogonal to everything above.
+**Setup.** [exo](https://github.com/exo-explore/exo) at commit `21a54c5`, run on stock MLX 0.32.0 with the same `mlx-community/Qwen3-14B-4bit` safetensors on the same two Macs over the Thunderbolt bridge. exo's automatic placement put the Air last and swapped it, so the run uses a hand-built placement, M4 layers 0–36 / Air 36–40 + lm_head. Two exo liveness timeouts were raised from 30 s to 600 s (failure detection only). Numbers are from exo's own benchmark harness: 128 generated tokens, greedy, cold KV cache, 2 warm-ups, 3 repeats. tributary runs use the same split reversed (Air 0–4 / M4 4–40), 128 tokens, 3 repeats. September 4, 2026.
 
-## Next
+exo, measured:
 
-- **Push α / cut draft cost** — the only lever that flips spec from tie to win. Sweep the cached drafts
-  (Qwen3-0.6B, and the z-lab DFlash 4B/8B) and K; measure α and draft ms per round.
-- **bf16 (or raw) on the wire** — remove the lossy fp16 round-trip entirely (protocol.rs + server dtype),
-  which also restores an exact-activation path.
-- Re-verify the Thunderbolt prediction on hardware once the bridge is back up.
+| Prompt tokens | Run | Prefill tok/s | Decode tok/s |
+|--:|--:|--:|--:|
+| 110 | 1 | 8.8 | 11.3 |
+| 110 | 2 | 1.7 | 11.5 |
+| 110 | 3 | 0.4 | 11.4 |
+| 256 | 1 | 18.3 | 11.4 |
+| 256 | 2 | 55.9 | 11.4 |
+| 256 | 3 | 0.6 | 11.5 |
+
+tributary at the matched split (Air 0–4 / M4 4–40); ranges are min–max over 3 repeats:
+
+| Config | p110 tok/s | p256 tok/s | α (p110 / p256) | ttft p110 / p256 | local | network | worker |
+|---|--:|--:|:--|:--|--:|--:|--:|
+| Plain pipeline | 8.9–9.0 | 8.9–9.0 | — | 1.66 s / 3.26 s | 22.6 ms | **0.6 ms** | 86.3 ms |
+| Spec 0.6B, K=1 | **11.6–11.8** | **10.4–10.5** | 0.76 / 0.57 | 1.70 s / 3.30 s | 51 ms/round | 0.6 ms | 92 ms/round |
+| Spec 0.6B, K=2 | 11.6–11.7 | 10.6 | 0.58 / 0.48 | 1.70 s / 3.29 s | 68 ms/round | 0.7 ms | 111 ms/round |
+
+tributary at its own 8/32 split, same protocol:
+
+| Config | p110 tok/s | p256 tok/s | local | worker |
+|---|--:|--:|--:|--:|
+| Plain pipeline | 8.8–9.1 | 9.0–9.1 | 27–29 ms | 80 ms |
+| Spec 0.6B, K=1 | 11.3–11.8 | 10.3–10.4 | 60 ms/round | 85 ms/round |
+| Spec 0.6B, K=2 | 10.1–10.2 | 9.2–9.4 | 90 ms/round | 114 ms/round |
+
+Comparison:
+
+| System (Thunderbolt, Qwen3-14B-4bit, 128 tokens) | p110 decode tok/s | p256 decode tok/s | Prefill |
+|---|--:|--:|---|
+| **exo**, pipeline, M4 0–36 / Air 36–40 | 11.5 | 11.5 | 0.4–56 tok/s, bimodal |
+| **tributary**, plain pipeline, same split | 9.0 | 9.0 | 66 / 79 tok/s |
+| **tributary + spec** (0.6B draft, K=1) | **11.7** | **10.5** | 66 / 79 tok/s |
+
+![exo head-to-head](figures/f7_exo.png)
+
+**Result.** On the plain pipeline exo is 28% faster (11.5 vs 9.0 tok/s). tributary's worker stage is 86 ms/token for the M4's 36 layers and exo's whole loop is 87 ms/token, so the gap is the Air's 22 ms local stage, of which ~4 ms is compute for four layers and the rest is five localhost HTTP hops per token. With speculative decoding tributary matches exo at p110 (11.7 vs 11.5) and is 9% behind at p256, where the 0.6B draft's acceptance falls to 0.57. On prefill tributary is ahead (66–79 vs 0.4–56 tok/s). The split does not matter on Thunderbolt: 4/36 and 8/32 give the same plain-pipeline number.
+
+**Caveat.** exo's prefill is bimodal because its last-rank runner on the 8 GB node loses its weight pages between requests; it should not be read as exo's prefill capability on adequate hardware. Single-node exo on the M4 loaded but did not complete a measured request, so there is no exo single-node reference. exo bans EOS and feeds synthetic token ids; tributary runs real text.
+
+---
+
+## 10. Acceptance vs the literature
+
+**Setup.** One MT-Bench turn-1 prompt per category (writing, roleplay, reasoning, math, coding, stem, humanities, extraction), greedy, 128 generated tokens, K ∈ {1, 2, 3, 4}. Llama pair on the M2 Air alone; Qwen pairs on the 14B split 0–8 / 8–40 with the draft on the Air (α is transport-independent). August 28, 2026.
+
+Tokens per round, measured vs predicted by Leviathan Eq. 1, `E[tokens/round] = (1 − α^(K+1)) / (1 − α)`, with α taken only from the K=1 run:
+
+| Pair | K | Logged α (accepted fraction) | τ measured | τ predicted from K=1 α | Error |
+|---|--:|--:|--:|--:|--:|
+| Llama-3.2-1B → 3B | 1 | **0.847** | 1.84 | — | — |
+| | 2 | 0.753 | 2.49 | 2.57 | −3% |
+| | 3 | 0.702 | 3.05 | 3.17 | −4% |
+| | 4 | 0.651 | 3.55 | 3.69 | −4% |
+| Qwen3-0.6B → 14B | 1 | **0.671** | 1.67 | — | — |
+| | 2 | 0.568 | 2.13 | 2.12 | +0% |
+| | 3 | 0.500 | 2.49 | 2.42 | +3% |
+| | 4 | 0.426 | 2.69 | 2.63 | +2% |
+| Qwen3-1.7B → 14B | 1 | **0.765** | 1.76 | — | — |
+| | 2 | 0.701 | 2.40 | 2.35 | +2% |
+| | 3 | 0.630 | 2.88 | 2.80 | +3% |
+| | 4 | 0.543 | 3.15 | 3.14 | +0% |
+
+![Capped-geometric law](figures/f2_capped_geometric.png)
+
+Per-domain α at K=1 (Leviathan's α):
+
+| Category | Llama 1B → 3B | Qwen 1.7B → 14B | Qwen 0.6B → 14B |
+|---|--:|--:|--:|
+| math | **0.984** | **0.896** | **0.841** |
+| extraction | 0.954 | 0.813 | 0.740 |
+| humanities | 0.855 | 0.841 | 0.716 |
+| writing | 0.829 | 0.628 | 0.542 |
+| coding | 0.814 | 0.868 | 0.716 |
+| reasoning | 0.809 | 0.778 | 0.662 |
+| stem | 0.764 | 0.730 | 0.620 |
+| roleplay | 0.764 | 0.568 | 0.530 |
+| **mean** | **0.847** | **0.765** | **0.671** |
+
+![Acceptance by domain](figures/f3_domains.png)
+
+Draft size vs throughput, Qwen pairs in the same runs: the 1.7B draft accepts more at every K (0.765 vs 0.671 at K=1) and emits fewer tokens per second at every K (12.4 vs 13.4 tok/s at K=1, 10.0 vs 10.7 at K=4).
+
+**Result.** One number measured at K=1 predicts tokens per round at K=2, 3, 4 within 4% for all three pairs. All three pairs sit in or above Leviathan's reported α band of 0.53–0.82. Domain ordering is stable across pairs: math and extraction are easiest, roleplay and open-ended writing hardest. A larger draft raises α and lowers throughput.
+
+**Caveat.** One prompt per category, one run per cell. The per-domain numbers are indicative.
+
+---
+
+## Correctness
+
+- **Greedy byte-identity (Llama-3.2-3B).** Speculative output at temperature 0 is byte-identical to plain greedy decoding on one machine, across two processes, across two machines on both transports, and across all four cells of the 2×2. Identity across varying K, and hence varying accept counts, is also the proof that the three KV caches (draft, local shard, worker) roll back consistently.
+- **Sampled exactness.** The first emitted token's distribution matches the target's exact distribution to within the direct-sampling noise floor (§4 table). The greedy-draft path was checked the same way: z-scores against the noise floor of 0.60 (T=0.3, N=800), 0.39 (T=0.8, N=2000), 1.70 (T=1.0, N=800).
+- **Reproducibility.** Same `--spec-seed` gives a byte-identical transcript; every exo-parity configuration was byte-identical across its three repeats.
+- **Qwen3-14B in bfloat16.** Batched verification and single-token decoding round differently, so greedy spec-on and spec-off transcripts agree on a long prefix and then diverge on a near-tie argmax. On this model the guarantee is the standard one for speculative decoding: the same distribution up to floating-point rounding.
